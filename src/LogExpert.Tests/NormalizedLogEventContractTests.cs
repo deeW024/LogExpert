@@ -90,11 +90,11 @@ public class NormalizedLogEventContractTests
         var heuristic = Attribution.From(
             "OneBlock",
             AttributionProvenance.Heuristic,
-            AttributionConfidence.High);
+            AttributionConfidence.Exact);
         var producerMetadata = Attribution.From(
             "ReCactus",
             AttributionProvenance.ExplicitMetadata,
-            AttributionConfidence.Medium);
+            AttributionConfidence.Low);
 
         AttributedValue<string> selected = Attribution.Prefer(heuristic, producerMetadata);
 
@@ -102,7 +102,45 @@ public class NormalizedLogEventContractTests
         {
             Assert.That(selected.Value, Is.EqualTo("ReCactus"));
             Assert.That(selected.Provenance, Is.EqualTo(AttributionProvenance.ExplicitMetadata));
-            Assert.That(selected.Confidence, Is.EqualTo(AttributionConfidence.Medium));
+            Assert.That(selected.Confidence, Is.EqualTo(AttributionConfidence.Low));
+        });
+    }
+
+    [Test]
+    public void Prefer_uses_confidence_when_provenance_is_equal ()
+    {
+        var lowConfidence = Attribution.From(
+            "parsed-low",
+            AttributionProvenance.Parsed,
+            AttributionConfidence.Low);
+        var highConfidence = Attribution.From(
+            "parsed-high",
+            AttributionProvenance.Parsed,
+            AttributionConfidence.High);
+
+        AttributedValue<string> selected = Attribution.Prefer(lowConfidence, highConfidence);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(selected.Value, Is.EqualTo("parsed-high"));
+            Assert.That(selected.Provenance, Is.EqualTo(AttributionProvenance.Parsed));
+            Assert.That(selected.Confidence, Is.EqualTo(AttributionConfidence.High));
+        });
+    }
+
+    [Test]
+    public void Unknown_value_type_does_not_expose_a_default_domain_value ()
+    {
+        AttributedValue<LogLevel> unknown = Attribution.Unknown<LogLevel>();
+        var knownTrace = Attribution.From(LogLevel.Trace, AttributionProvenance.Parsed, AttributionConfidence.Exact);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(unknown.IsKnown, Is.False);
+            Assert.That(unknown.TryGetValue(out _), Is.False);
+            Assert.That(() => unknown.Value, Throws.InvalidOperationException);
+            Assert.That(knownTrace.TryGetValue(out LogLevel level), Is.True);
+            Assert.That(level, Is.EqualTo(LogLevel.Trace));
         });
     }
 

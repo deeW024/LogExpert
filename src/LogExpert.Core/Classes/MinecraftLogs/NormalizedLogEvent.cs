@@ -1,3 +1,5 @@
+using System.Diagnostics.CodeAnalysis;
+
 namespace LogExpert.Core.Classes.MinecraftLogs;
 
 public sealed record FileRef (string FileId, string Path, long Generation);
@@ -45,20 +47,36 @@ public enum LogLevel
 /// <summary>A known value and how it was attributed, or an explicit Unknown value.</summary>
 public sealed record AttributedValue<T>
 {
+    private readonly T? _value;
+
     internal AttributedValue (T? value, AttributionProvenance provenance, AttributionConfidence confidence)
     {
-        Value = value;
+        _value = value;
         Provenance = provenance;
         Confidence = confidence;
     }
 
-    public T? Value { get; }
+    public T Value => TryGetValue(out T? value)
+        ? value
+        : throw new InvalidOperationException();
 
     public AttributionProvenance Provenance { get; }
 
     public AttributionConfidence Confidence { get; }
 
     public bool IsKnown => Provenance != AttributionProvenance.Unknown;
+
+    public bool TryGetValue ([MaybeNullWhen(false)] out T value)
+    {
+        if (IsKnown)
+        {
+            value = _value!;
+            return true;
+        }
+
+        value = default!;
+        return false;
+    }
 }
 
 public static class Attribution
@@ -87,7 +105,17 @@ public static class Attribution
         ArgumentNullException.ThrowIfNull(first);
         ArgumentNullException.ThrowIfNull(second);
 
-        return GetPrecedence(first.Provenance) <= GetPrecedence(second.Provenance) ? first : second;
+        int firstProvenance = GetPrecedence(first.Provenance);
+        int secondProvenance = GetPrecedence(second.Provenance);
+
+        if (firstProvenance != secondProvenance)
+        {
+            return firstProvenance < secondProvenance ? first : second;
+        }
+
+        return GetConfidencePrecedence(first.Confidence) <= GetConfidencePrecedence(second.Confidence)
+            ? first
+            : second;
     }
 
     private static int GetPrecedence (AttributionProvenance provenance) => provenance switch
@@ -96,6 +124,15 @@ public static class Attribution
         AttributionProvenance.Adapter => 1,
         AttributionProvenance.Parsed => 2,
         AttributionProvenance.Heuristic => 3,
+        _ => 4
+    };
+
+    private static int GetConfidencePrecedence (AttributionConfidence confidence) => confidence switch
+    {
+        AttributionConfidence.Exact => 0,
+        AttributionConfidence.High => 1,
+        AttributionConfidence.Medium => 2,
+        AttributionConfidence.Low => 3,
         _ => 4
     };
 }
