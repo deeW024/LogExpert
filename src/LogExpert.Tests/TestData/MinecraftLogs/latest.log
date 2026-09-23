@@ -1,0 +1,3 @@
+[18:41:03] [Render thread/ERROR]: Synthetic failure
+java.lang.IllegalStateException: synthetic fixture
+    at example.client.Tick.run(Tick.java:1)
