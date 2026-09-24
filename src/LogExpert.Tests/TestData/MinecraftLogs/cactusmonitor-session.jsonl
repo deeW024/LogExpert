@@ -1,1 +1,1 @@
-{"type":"CYCLE","sessionId":"fixture-session","runId":"fixture-run","generation":1,"sequence":7,"cycle":3,"timestampEpochMillis":1790181663412,"sessionTimeNanos":1200000,"mode":"COMPACT","fields":{"state":"ok"},"stats":{"count":1}}
+{"type":"CYCLE","sessionId":"fixture-session","runId":"fixture-run","generation":1,"sequence":7,"cycle":3,"timestampEpochMillis":1790181663412,"sessionTimeNanos":1200000,"mode":"COMPACT","state":"ok","stats":{"count":1}}
