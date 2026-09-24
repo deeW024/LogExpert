@@ -6,10 +6,6 @@ namespace LogExpert.Core.Classes.MinecraftLogs;
 
 public sealed class MinecraftLatestLogParser : ILogEventParser
 {
-    private static readonly Regex HeaderPattern = new(
-        @"^\[(?<timestamp>\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?)\] \[(?<thread>[^/\]\r\n]+)/(?<level>[^\]\r\n]+)\](?:: ?(?<plainMessage>[^\r\n]*)| \((?<category>[^()\r\n]+)\)(?:: ?| +)(?<categoryMessage>[^\r\n]*))$",
-        RegexOptions.CultureInvariant);
-
     public string ParserId => "minecraft.latest-log";
 
     public NormalizedLogEvent Parse (LogParserInput input)
@@ -18,7 +14,7 @@ public sealed class MinecraftLatestLogParser : ILogEventParser
 
         string rawText = LogEventParserSupport.GetRawText(input);
         string header = LogEventParserSupport.GetHeaderLine(rawText, out string continuation);
-        Match match = HeaderPattern.Match(header);
+        Match match = MinecraftLogHeaderRecognizer.MatchMinecraftLatestLog(header);
         if (!match.Success)
         {
             return LogEventParserSupport.Create(
@@ -63,10 +59,6 @@ public sealed class MinecraftLatestLogParser : ILogEventParser
 
 public sealed class YeezusTextLogParser : ILogEventParser
 {
-    private static readonly Regex HeaderPattern = new(
-        @"^(?<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})) \[(?<level>[^\]\r\n]+)\] \[(?<context>[^\]\r\n]+)\] \[(?<thread>[^\]\r\n]+)\] (?<message>[^\r\n]*)$",
-        RegexOptions.CultureInvariant);
-
     private static readonly AttributedValue<string> YeezusSource =
         Attribution.From("Yeezus", AttributionProvenance.Adapter, AttributionConfidence.High);
 
@@ -78,7 +70,7 @@ public sealed class YeezusTextLogParser : ILogEventParser
 
         string rawText = LogEventParserSupport.GetRawText(input);
         string header = LogEventParserSupport.GetHeaderLine(rawText, out string continuation);
-        Match match = HeaderPattern.Match(header);
+        Match match = MinecraftLogHeaderRecognizer.MatchYeezusTextLog(header);
         if (!match.Success)
         {
             return LogEventParserSupport.Create(
