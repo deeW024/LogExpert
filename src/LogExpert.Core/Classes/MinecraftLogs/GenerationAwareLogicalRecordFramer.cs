@@ -8,6 +8,11 @@ public enum LogicalRecordFramingStrategy
     HeaderDelimited
 }
 
+public sealed record LogicalRecordReplayStart (
+    long ByteOffset,
+    long PhysicalLineNumber,
+    bool HasUnemittedState);
+
 /// <summary>Maps discovered source adapter hints to deterministic framing strategies.</summary>
 public static class MinecraftSourceFramingResolver
 {
@@ -21,8 +26,10 @@ public static class MinecraftSourceFramingResolver
             _ => throw new ArgumentOutOfRangeException(nameof(adapterHint), adapterHint, null)
         };
 
-    public static GenerationAwareLogicalRecordFramer CreateFramer (MinecraftSourceAdapterHint adapterHint) =>
-        new(adapterHint);
+    public static GenerationAwareLogicalRecordFramer CreateFramer (
+        MinecraftSourceAdapterHint adapterHint,
+        long initialSourceLocalSequence = 1) =>
+        new(adapterHint, initialSourceLocalSequence);
 }
 
 /// <summary>
@@ -41,15 +48,78 @@ public sealed class GenerationAwareLogicalRecordFramer
     private long _nextSourceLocalSequence = 1;
     private bool _generationFinalized;
 
-    public GenerationAwareLogicalRecordFramer (MinecraftSourceAdapterHint adapterHint)
+    public GenerationAwareLogicalRecordFramer (
+        MinecraftSourceAdapterHint adapterHint,
+        long initialSourceLocalSequence = 1)
     {
+        ArgumentOutOfRangeException.ThrowIfLessThan(initialSourceLocalSequence, 1);
+
         _adapterHint = adapterHint;
         _strategy = MinecraftSourceFramingResolver.Resolve(adapterHint);
+        _nextSourceLocalSequence = initialSourceLocalSequence;
     }
 
     public MinecraftSourceAdapterHint AdapterHint => _adapterHint;
 
     public LogicalRecordFramingStrategy Strategy => _strategy;
+
+    public long NextSourceLocalSequence => _nextSourceLocalSequence;
+
+    /// <summary>
+    /// Returns the earliest physical position that must be replayed to reconstruct un-emitted
+    /// state. This query does not change or finalize the framer.
+    /// </summary>
+    public LogicalRecordReplayStart GetReplayStart (long consumedByteFrontier, long nextPhysicalLineNumber)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(consumedByteFrontier);
+        ArgumentOutOfRangeException.ThrowIfLessThan(nextPhysicalLineNumber, 1);
+
+        if (_file is null)
+        {
+            throw new InvalidOperationException();
+        }
+
+        if (_strategy == LogicalRecordFramingStrategy.HeaderDelimited && _currentRecord is { Count: > 0 } record)
+        {
+            PhysicalLineObservation first = record[0];
+            return new LogicalRecordReplayStart(first.StartByteOffset, first.LineNumber, HasUnemittedState: true);
+        }
+
+        if (_pendingLine is not null)
+        {
+            return new LogicalRecordReplayStart(
+                _pendingLine.StartByteOffset,
+                _pendingLine.LineNumber,
+                HasUnemittedState: true);
+        }
+
+        return new LogicalRecordReplayStart(
+            consumedByteFrontier,
+            nextPhysicalLineNumber,
+            HasUnemittedState: false);
+    }
+
+    /// <summary>
+    /// Abandons pending generation state without producing parser inputs. Use only when a
+    /// successor will replay from a previously captured handoff checkpoint.
+    /// </summary>
+    public void AbandonGeneration (bool reserveSourceLocalSequenceForReplay = false)
+    {
+        if (_file is null || _generationFinalized)
+        {
+            return;
+        }
+
+        if (reserveSourceLocalSequenceForReplay &&
+            (_pendingLine is not null || _currentRecord is { Count: > 0 }))
+        {
+            _nextSourceLocalSequence = checked(_nextSourceLocalSequence + 1);
+        }
+
+        _pendingLine = null;
+        _currentRecord = null;
+        _generationFinalized = true;
+    }
 
     /// <summary>
     /// Starts an externally identified generation. If another generation is active, its

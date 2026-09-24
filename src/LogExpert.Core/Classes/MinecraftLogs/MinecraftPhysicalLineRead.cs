@@ -12,6 +12,8 @@ public interface IMinecraftPhysicalLineObserver
 
     void OnSourceTruncated ();
 
+    void OnSourceTruncated (long previouslyObservedFileLength) => OnSourceTruncated();
+
     void OnSourceDeleted ();
 
     void OnSourceRecreated ();

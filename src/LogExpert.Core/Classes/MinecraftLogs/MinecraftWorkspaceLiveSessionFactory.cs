@@ -23,7 +23,9 @@ public interface IMinecraftWorkspaceLiveSourceSessionFactory
 /// Creates YEE-42 sessions through the existing single-file SystemDirect reader path.
 /// XML mode stays disabled, and no second reader or watcher is introduced.
 /// </summary>
-public sealed class MinecraftWorkspaceLiveSourceSessionFactory : IMinecraftWorkspaceLiveSourceSessionFactory
+public sealed class MinecraftWorkspaceLiveSourceSessionFactory :
+    IMinecraftWorkspaceLiveSourceSessionFactory,
+    IMinecraftWorkspaceLiveSourceSessionFactoryWithReadRequest
 {
     private readonly IPluginRegistry _pluginRegistry;
     private readonly EncodingOptions _encodingOptions;
@@ -47,6 +49,20 @@ public sealed class MinecraftWorkspaceLiveSourceSessionFactory : IMinecraftWorks
     {
         ArgumentNullException.ThrowIfNull(source);
 
+        MinecraftWorkspaceSourceReadRequest readRequest = source.SegmentRole is
+            MinecraftSourceSegmentRole.Rotated or MinecraftSourceSegmentRole.Final
+                ? MinecraftWorkspaceSourceReadRequest.Snapshot()
+                : MinecraftWorkspaceSourceReadRequest.Live();
+        return Create(source, readRequest);
+    }
+
+    public IMinecraftWorkspaceLiveSourceSession Create (
+        DiscoveredSourceFile source,
+        MinecraftWorkspaceSourceReadRequest readRequest)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        ArgumentNullException.ThrowIfNull(readRequest);
+
         var reader = new LogfileReader(
             source.FullPath,
             _encodingOptions,
@@ -60,7 +76,9 @@ public sealed class MinecraftWorkspaceLiveSourceSessionFactory : IMinecraftWorks
 
         try
         {
-            return new OwnedMinecraftLiveSourceSession(new MinecraftLiveSourceSession(source, reader), reader);
+            return new OwnedMinecraftLiveSourceSession(
+                new MinecraftLiveSourceSession(source, reader, readRequest),
+                reader);
         }
         catch
         {
@@ -69,10 +87,14 @@ public sealed class MinecraftWorkspaceLiveSourceSessionFactory : IMinecraftWorks
         }
     }
 
-    private sealed class OwnedMinecraftLiveSourceSession : IMinecraftWorkspaceLiveSourceSession
+    private sealed class OwnedMinecraftLiveSourceSession :
+        IMinecraftWorkspaceLiveSourceSession,
+        IMinecraftWorkspaceLiveSourceSessionProgress,
+        IMinecraftWorkspaceSourceHandoffSession
     {
         private readonly MinecraftLiveSourceSession _session;
         private readonly LogfileReader _reader;
+        private EventHandler<MinecraftWorkspaceHandoffCheckpointEventArgs>? _handoffCheckpointCaptured;
         private int _disposed;
 
         public OwnedMinecraftLiveSourceSession (MinecraftLiveSourceSession session, LogfileReader reader)
@@ -80,9 +102,28 @@ public sealed class MinecraftWorkspaceLiveSourceSessionFactory : IMinecraftWorks
             _session = session;
             _reader = reader;
             _session.EventsProduced += ForwardEvents;
+            _session.HandoffCheckpointCaptured += ForwardHandoffCheckpoint;
         }
 
         public event EventHandler<MinecraftLiveSourceEventsProducedEventArgs>? EventsProduced;
+
+        public event EventHandler<MinecraftWorkspaceHandoffCheckpointEventArgs>? HandoffCheckpointCaptured
+        {
+            add => _handoffCheckpointCaptured += value;
+            remove => _handoffCheckpointCaptured -= value;
+        }
+
+        public FileRef CurrentFile => _session.CurrentFile;
+
+        public long NextSourceLocalSequence => _session.NextSourceLocalSequence;
+
+        public bool IsImmutableComplete => _session.IsImmutableComplete;
+
+        public MinecraftSourceHandoffCheckpoint GetHandoffCheckpoint () =>
+            _session.GetHandoffCheckpoint();
+
+        public MinecraftSourceHandoffCheckpoint CaptureAndCloseForHandoff () =>
+            _session.CaptureAndCloseForHandoff();
 
         public void StartMonitoring () => _session.StartMonitoring();
 
@@ -100,11 +141,15 @@ public sealed class MinecraftWorkspaceLiveSourceSessionFactory : IMinecraftWorks
             finally
             {
                 _session.EventsProduced -= ForwardEvents;
+                _session.HandoffCheckpointCaptured -= ForwardHandoffCheckpoint;
                 _reader.Dispose();
             }
         }
 
         private void ForwardEvents (object? sender, MinecraftLiveSourceEventsProducedEventArgs args) =>
             EventsProduced?.Invoke(this, args);
+
+        private void ForwardHandoffCheckpoint (object? sender, MinecraftWorkspaceHandoffCheckpointEventArgs args) =>
+            _handoffCheckpointCaptured?.Invoke(this, args);
     }
 }
