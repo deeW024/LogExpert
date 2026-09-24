@@ -462,6 +462,64 @@ internal sealed class MinecraftWorkspaceLiveCoordinatorTests
     }
 
     [Test]
+    public void Ingress_timestamp_uses_the_injected_clock_at_enqueue_boundary_and_normalizes_to_utc ()
+    {
+        string path = CreateFile("logs/latest.log");
+        var factory = new FakeSessionFactory();
+        var clock = new SequenceTimeProvider(
+            new DateTimeOffset(2026, 9, 25, 12, 0, 0, TimeSpan.FromHours(2)),
+            new DateTimeOffset(2026, 9, 25, 12, 1, 0, TimeSpan.FromHours(2)));
+        using var coordinator = new MinecraftWorkspaceLiveCoordinator(CreateDiscovery(), factory, clock);
+        coordinator.Reconcile();
+        FakeSession session = factory.GetSession(path);
+        DiscoveredSourceFile source = GetSource(path);
+
+        session.Emit(CreateEvent(source, 1, "first"));
+        session.Emit(CreateEvent(source, 2, "second"));
+        IReadOnlyList<MinecraftWorkspaceIngressEvent> drained = coordinator.DrainPendingEvents();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(drained.Select(item => item.IngressSequence), Is.EqualTo(new long[] { 1, 2 }));
+            Assert.That(drained.Select(item => item.IngestedAtUtc), Is.EqualTo(new[]
+            {
+                new DateTimeOffset(2026, 9, 25, 10, 0, 0, TimeSpan.Zero),
+                new DateTimeOffset(2026, 9, 25, 10, 1, 0, TimeSpan.Zero)
+            }));
+            Assert.That(drained.All(item => item.IngestedAtUtc.Offset == TimeSpan.Zero), Is.True);
+        });
+    }
+
+    [Test]
+    public void Ingress_timestamp_is_clamped_when_wall_clock_moves_backwards ()
+    {
+        string path = CreateFile("logs/latest.log");
+        var factory = new FakeSessionFactory();
+        var clock = new SequenceTimeProvider(
+            new DateTimeOffset(2026, 9, 25, 10, 5, 0, TimeSpan.Zero),
+            new DateTimeOffset(2026, 9, 25, 10, 3, 0, TimeSpan.Zero));
+        using var coordinator = new MinecraftWorkspaceLiveCoordinator(CreateDiscovery(), factory, clock);
+        coordinator.Reconcile();
+        FakeSession session = factory.GetSession(path);
+        DiscoveredSourceFile source = GetSource(path);
+
+        session.Emit(CreateEvent(source, 1, "first"));
+        session.Emit(CreateEvent(source, 2, "second"));
+        IReadOnlyList<MinecraftWorkspaceIngressEvent> drained = coordinator.DrainPendingEvents();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(drained.Select(item => item.IngressSequence), Is.EqualTo(new long[] { 1, 2 }));
+            Assert.That(drained.Select(item => item.IngestedAtUtc), Is.EqualTo(new[]
+            {
+                new DateTimeOffset(2026, 9, 25, 10, 5, 0, TimeSpan.Zero),
+                new DateTimeOffset(2026, 9, 25, 10, 5, 0, TimeSpan.Zero)
+            }));
+            Assert.That(drained[1].IngestedAtUtc, Is.GreaterThanOrEqualTo(drained[0].IngestedAtUtc));
+        });
+    }
+
+    [Test]
     public async Task Real_reader_sessions_for_two_sources_publish_initial_loads_and_independent_appends ()
     {
         const string initialAlpha = "{\"type\":\"CYCLE\",\"sessionId\":\"alpha\",\"sequence\":1,\"timestampEpochMillis\":1790181663412}\n";
@@ -737,8 +795,10 @@ internal sealed class MinecraftWorkspaceLiveCoordinatorTests
         public IMinecraftWorkspaceLiveSourceSession GetSession (string path) => Sessions[path];
     }
 
-    private MinecraftWorkspaceLiveCoordinator CreateCoordinator (FakeSessionFactory factory) =>
-        new(CreateDiscovery(), factory);
+    private MinecraftWorkspaceLiveCoordinator CreateCoordinator (
+        FakeSessionFactory factory,
+        TimeProvider? timeProvider = null) =>
+        new(CreateDiscovery(), factory, timeProvider);
 
     private MinecraftSourceDiscovery CreateDiscovery () =>
         new(new MinecraftWorkspace(_testDirectory));
@@ -781,6 +841,13 @@ internal sealed class MinecraftWorkspaceLiveCoordinatorTests
             EventParseStatus.Parsed,
             rawText,
             rawText);
+    }
+
+    private sealed class SequenceTimeProvider (params DateTimeOffset[] readings) : TimeProvider
+    {
+        private readonly Queue<DateTimeOffset> _readings = new(readings);
+
+        public override DateTimeOffset GetUtcNow () => _readings.Dequeue();
     }
 
     private static async Task WaitUntil (Func<bool> condition, string failureMessage)
