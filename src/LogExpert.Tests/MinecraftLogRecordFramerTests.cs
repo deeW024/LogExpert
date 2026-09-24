@@ -114,6 +114,36 @@ public sealed class MinecraftLogRecordFramerTests
     }
 
     [Test]
+    public void Line_delimited_replay_checkpoint_at_consumed_frontier_is_exact_and_read_only ()
+    {
+        FileRef file = CreateFile();
+        var framer = new GenerationAwareLogicalRecordFramer(MinecraftSourceAdapterHint.CactusMonitorSessionJsonl);
+        framer.BeginGeneration(file);
+        const string first = "{\"type\":\"CYCLE\",\"sequence\":1}";
+        const string next = "{\"type\":\"END\",\"sequence\":2}";
+        PhysicalLineObservation completed = CreateLine(file, 7, 120, first, PhysicalLineTerminator.Lf);
+        Assert.That(framer.Accept(completed), Has.Count.EqualTo(1));
+
+        long consumedFrontier = completed.EndByteOffset + completed.TerminatorByteLength;
+        const long nextLine = 8;
+        LogicalRecordReplayStart checkpoint = framer.GetReplayStart(consumedFrontier, nextLine);
+        LogicalRecordReplayStart repeated = framer.GetReplayStart(consumedFrontier, nextLine);
+        IReadOnlyList<LogParserInput> afterCheckpoint = framer.Accept(
+            CreateLine(file, nextLine, consumedFrontier, next, PhysicalLineTerminator.Lf));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(checkpoint, Is.EqualTo(repeated));
+            Assert.That(checkpoint.ByteOffset, Is.EqualTo(consumedFrontier));
+            Assert.That(checkpoint.PhysicalLineNumber, Is.EqualTo(nextLine));
+            Assert.That(checkpoint.HasUnemittedState, Is.False);
+            Assert.That(afterCheckpoint, Has.Count.EqualTo(1));
+            Assert.That(afterCheckpoint[0].RawText, Is.EqualTo(next));
+            Assert.That(afterCheckpoint[0].SourceLocalSequence, Is.EqualTo(2));
+        });
+    }
+
+    [Test]
     public void Header_delimited_replay_checkpoint_starts_at_pending_event_header_without_finalizing_it ()
     {
         FileRef file = CreateFile();

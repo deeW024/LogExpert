@@ -780,12 +780,16 @@ public sealed class MinecraftWorkspaceLiveCoordinator : IDisposable
         DiscoveredSourceFile successor,
         MinecraftSourceHandoffCheckpoint checkpoint)
     {
-        SourceProgress next = GetNextProgress(successor.FileId);
+        SourceProgress successorProgress = GetNextProgress(successor.FileId);
+        // Reused successor FileIds retain their prior sequence frontier across generations.
+        long initialSourceLocalSequence = Math.Max(
+            checkpoint.NextSourceLocalSequence,
+            successorProgress.NextSourceLocalSequence);
         return MinecraftWorkspaceSourceReadRequest.Snapshot(
             checkpoint.ReplayStartByteOffset,
             checkpoint.ReplayStartPhysicalLineNumber,
-            next.Generation,
-            checkpoint.NextSourceLocalSequence);
+            successorProgress.Generation,
+            initialSourceLocalSequence);
     }
 
     private SourceProgress GetNextProgress (string fileId)

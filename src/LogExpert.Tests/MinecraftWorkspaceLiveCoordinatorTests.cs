@@ -555,15 +555,19 @@ internal sealed class MinecraftWorkspaceLiveCoordinatorTests
     }
 
     [Test]
-    public async Task Real_yeezus_rotation_reuses_existing_rotated_file_and_continues_primary_generation ()
+    public async Task Real_yeezus_rotation_reuses_historical_rotated_file_without_regressing_sequence ()
     {
-        const string historyHeader = "2026-09-24T09:59:00+02:00 [INFO] [yeezus] [Client thread] prior rotation";
+        const string historyHeaderOne = "2026-09-24T09:57:00+02:00 [INFO] [yeezus] [Client thread] prior rotation one";
+        const string historyHeaderTwo = "2026-09-24T09:58:00+02:00 [INFO] [yeezus] [Client thread] prior rotation two";
+        const string historyHeaderThree = "2026-09-24T09:59:00+02:00 [INFO] [yeezus] [Client thread] prior rotation three";
         const string firstHeader = "2026-09-24T10:00:00+02:00 [ERROR] [yeezus-core] [Client thread] first";
         const string firstStack = "    at example.Client.first(Client.java:1)";
         const string pendingHeader = "2026-09-24T10:00:01+02:00 [ERROR] [yeezus-core] [Client thread] pending";
         const string newPrimaryHeader = "2026-09-24T10:00:02+02:00 [INFO] [yeezus] [Client thread] new primary";
         const string nextPrimaryHeader = "2026-09-24T10:00:03+02:00 [INFO] [yeezus] [Client thread] next";
-        string rotatedPath = CreateFile("logs/yeezus.log.1", historyHeader + "\n");
+        string rotatedPath = CreateFile(
+            "logs/yeezus.log.1",
+            historyHeaderOne + "\n" + historyHeaderTwo + "\n" + historyHeaderThree + "\n");
         string primaryPath = CreateFile("logs/yeezus.log", firstHeader + "\n" + firstStack + "\n" + pendingHeader + "\n");
         var factory = new RecordingRealSessionFactory(
             PluginRegistry.PluginRegistry.Instance,
@@ -572,8 +576,16 @@ internal sealed class MinecraftWorkspaceLiveCoordinatorTests
         using var coordinator = new MinecraftWorkspaceLiveCoordinator(CreateDiscovery(), factory);
         coordinator.Reconcile();
 
-        await WaitUntil(() => coordinator.PendingCount >= 2, "Initial Yeezus history and primary events were not ingressed").ConfigureAwait(false);
+        await WaitUntil(() => coordinator.PendingCount >= 4, "Initial Yeezus history and primary events were not ingressed").ConfigureAwait(false);
         IReadOnlyList<MinecraftWorkspaceIngressEvent> initial = coordinator.DrainPendingEvents();
+        MinecraftWorkspaceSourceRuntimeState initialRotation = FindState(coordinator, rotatedPath);
+        long priorRotatedNextSequence = initialRotation.NextSourceLocalSequence;
+        Assert.Multiple(() =>
+        {
+            Assert.That(initialRotation.Generation, Is.EqualTo(1));
+            Assert.That(priorRotatedNextSequence, Is.EqualTo(4), "the historical rotated source has already consumed three events");
+        });
+
         IMinecraftWorkspaceLiveSourceSessionProgress primaryProgress =
             (IMinecraftWorkspaceLiveSourceSessionProgress)factory.GetSession(primaryPath);
         Assert.That(primaryProgress.NextSourceLocalSequence, Is.EqualTo(2), "the second primary record is pending");
@@ -587,7 +599,7 @@ internal sealed class MinecraftWorkspaceLiveCoordinatorTests
         coordinator.Reconcile();
         DateTimeOffset handoffDeadline = DateTimeOffset.UtcNow.AddSeconds(8);
         while (DateTimeOffset.UtcNow < handoffDeadline &&
-            factory.ReadRequestsByPath[rotatedPath].InitialSourceLocalSequence != 2)
+            factory.ReadRequestsByPath[rotatedPath].InitialGeneration != initialRotation.Generation + 1)
         {
             coordinator.Reconcile();
             await Task.Delay(20).ConfigureAwait(false);
@@ -595,16 +607,20 @@ internal sealed class MinecraftWorkspaceLiveCoordinatorTests
 
         MinecraftWorkspaceSourceRuntimeState handoffAttempt = FindState(coordinator, rotatedPath);
         Assert.That(
-            factory.ReadRequestsByPath[rotatedPath].InitialSourceLocalSequence,
-            Is.EqualTo(2),
+            factory.ReadRequestsByPath[rotatedPath].InitialGeneration,
+            Is.EqualTo(initialRotation.Generation + 1),
             $"rotated state={handoffAttempt.Status}/{handoffAttempt.Reason}; checkpoint={handoffAttempt.Checkpoint}");
 
         MinecraftWorkspaceSourceRuntimeState replayedRotation = FindState(coordinator, rotatedPath);
         MinecraftSourceHandoffCheckpoint rotationCheckpoint = replayedRotation.Checkpoint!;
+        MinecraftWorkspaceSourceReadRequest rotatedReadRequest = factory.ReadRequestsByPath[rotatedPath];
         Assert.That(replayedRotation.Status, Is.EqualTo(MinecraftWorkspaceSourceStatus.ImmutableComplete));
-        Assert.That(rotationCheckpoint.ReplayStartByteOffset, Is.LessThan(rotationCheckpoint.ConsumedByteFrontier));
-        Assert.That(factory.ReadRequestsByPath[rotatedPath].StartByteOffset, Is.EqualTo(Utf8.GetByteCount(firstHeader + "\n" + firstStack + "\n")));
-        Assert.That(factory.ReadRequestsByPath[rotatedPath].InitialSourceLocalSequence, Is.EqualTo(2));
+        Assert.That(rotationCheckpoint.ReplayStartByteOffset, Is.EqualTo(Utf8.GetByteCount(firstHeader + "\n" + firstStack + "\n")));
+        Assert.That(rotationCheckpoint.ReplayStartPhysicalLineNumber, Is.EqualTo(3));
+        Assert.That(rotatedReadRequest.StartByteOffset, Is.EqualTo(rotationCheckpoint.ReplayStartByteOffset));
+        Assert.That(rotatedReadRequest.StartPhysicalLineNumber, Is.EqualTo(rotationCheckpoint.ReplayStartPhysicalLineNumber));
+        Assert.That(rotatedReadRequest.InitialGeneration, Is.EqualTo(initialRotation.Generation + 1));
+        Assert.That(rotatedReadRequest.InitialSourceLocalSequence, Is.EqualTo(priorRotatedNextSequence));
 
         Assert.That(primaryProgress.NextSourceLocalSequence, Is.EqualTo(3));
         await File.AppendAllTextAsync(primaryPath, nextPrimaryHeader + "\n", Utf8).ConfigureAwait(false);
@@ -617,9 +633,24 @@ internal sealed class MinecraftWorkspaceLiveCoordinatorTests
         {
             Assert.That(initial.Any(item => item.Event.RawText == pendingHeader), Is.False);
             Assert.That(initial.Count(item => item.Event.RawText == firstHeader + "\n" + firstStack), Is.EqualTo(1));
-            Assert.That(replayedPending.FileId, Is.EqualTo(GetSource(rotatedPath).FileId));
+            Assert.That(initial.Count(item => item.Event.RawText == historyHeaderOne), Is.EqualTo(1));
+            Assert.That(initial.Count(item => item.Event.RawText == historyHeaderTwo), Is.EqualTo(1));
+            Assert.That(initial.Count(item => item.Event.RawText == historyHeaderThree), Is.EqualTo(1));
+            Assert.That(afterRotation.Any(item => item.Event.RawText == historyHeaderOne), Is.False);
+            Assert.That(afterRotation.Any(item => item.Event.RawText == historyHeaderTwo), Is.False);
+            Assert.That(afterRotation.Any(item => item.Event.RawText == historyHeaderThree), Is.False);
+            Assert.That(
+                initial.Concat(afterRotation).Count(item => item.Event.RawText == historyHeaderOne),
+                Is.EqualTo(1));
+            Assert.That(
+                initial.Concat(afterRotation).Count(item => item.Event.RawText == historyHeaderTwo),
+                Is.EqualTo(1));
+            Assert.That(
+                initial.Concat(afterRotation).Count(item => item.Event.RawText == historyHeaderThree),
+                Is.EqualTo(1));
+            Assert.That(replayedPending.FileId, Is.EqualTo(initialRotation.Source.FileId));
             Assert.That(replayedPending.Event.Ref.File.Generation, Is.EqualTo(2));
-            Assert.That(replayedPending.Event.Ref.SourceLocalSequence, Is.EqualTo(2));
+            Assert.That(replayedPending.Event.Ref.SourceLocalSequence, Is.GreaterThanOrEqualTo(priorRotatedNextSequence));
             Assert.That(newPrimary.FileId, Is.EqualTo(GetSource(primaryPath).FileId));
             Assert.That(newPrimary.Event.Ref.File.Generation, Is.EqualTo(2));
             Assert.That(newPrimary.Event.Ref.SourceLocalSequence, Is.EqualTo(3));
