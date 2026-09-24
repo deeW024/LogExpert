@@ -39,7 +39,8 @@ public sealed record MinecraftWorkspaceIngressEvent (
     string SourceId,
     string FileId,
     MinecraftSourceSegmentRole SegmentRole,
-    NormalizedLogEvent Event);
+    NormalizedLogEvent Event,
+    DateTimeOffset IngestedAtUtc);
 
 /// <summary>
 /// Reconciles YEE-39 physical discovery with YEE-42 single-file sessions. The ingress queue
@@ -50,6 +51,7 @@ public sealed class MinecraftWorkspaceLiveCoordinator : IDisposable
 {
     private readonly MinecraftSourceDiscovery _discovery;
     private readonly IMinecraftWorkspaceLiveSourceSessionFactory _sessionFactory;
+    private readonly TimeProvider _timeProvider;
     private readonly object _reconcileGate = new();
     private readonly object _gate = new();
     private readonly Dictionary<string, SourceHandle> _sessions = new(StringComparer.Ordinal);
@@ -61,19 +63,22 @@ public sealed class MinecraftWorkspaceLiveCoordinator : IDisposable
     private readonly HashSet<string> _activatedPrimarySourceIds = new(StringComparer.Ordinal);
     private readonly Queue<MinecraftWorkspaceIngressEvent> _pendingEvents = new();
     private long _nextIngressSequence = 1;
+    private DateTimeOffset? _lastIngestedAtUtc;
     private bool _hasReconciled;
     private bool _disposeStarted;
     private bool _disposeComplete;
 
     public MinecraftWorkspaceLiveCoordinator (
         MinecraftSourceDiscovery discovery,
-        IMinecraftWorkspaceLiveSourceSessionFactory sessionFactory)
+        IMinecraftWorkspaceLiveSourceSessionFactory sessionFactory,
+        TimeProvider? timeProvider = null)
     {
         ArgumentNullException.ThrowIfNull(discovery);
         ArgumentNullException.ThrowIfNull(sessionFactory);
 
         _discovery = discovery;
         _sessionFactory = sessionFactory;
+        _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
     /// <summary>Number of queued, undrained workspace events.</summary>
@@ -593,13 +598,15 @@ public sealed class MinecraftWorkspaceLiveCoordinator : IDisposable
             {
                 long ingressSequence = _nextIngressSequence;
                 _nextIngressSequence = checked(_nextIngressSequence + 1);
+                DateTimeOffset ingestedAtUtc = CaptureIngestedAtUtc();
                 _pendingEvents.Enqueue(new MinecraftWorkspaceIngressEvent(
                     ingressSequence,
                     handle.Source.WorkspaceId,
                     handle.Source.SourceId,
                     handle.Source.FileId,
                     handle.Source.SegmentRole,
-                    parsedEvent));
+                    parsedEvent,
+                    ingestedAtUtc));
                 handle.EmittedEventCount = checked(handle.EmittedEventCount + 1);
             }
 
@@ -614,6 +621,18 @@ public sealed class MinecraftWorkspaceLiveCoordinator : IDisposable
                 };
             }
         }
+    }
+
+    private DateTimeOffset CaptureIngestedAtUtc ()
+    {
+        DateTimeOffset ingestedAtUtc = _timeProvider.GetUtcNow().ToUniversalTime();
+        if (_lastIngestedAtUtc is DateTimeOffset previous && ingestedAtUtc < previous)
+        {
+            ingestedAtUtc = previous;
+        }
+
+        _lastIngestedAtUtc = ingestedAtUtc;
+        return ingestedAtUtc;
     }
 
     private void OnHandoffCheckpoint (
