@@ -7,7 +7,7 @@ namespace LogExpert.Core.Classes.MinecraftLogs;
 /// Bridges one discovered physical Minecraft source to the existing LogfileReader,
 /// generation-aware framer, and source parser. The reader owns all file reads and polling.
 /// </summary>
-public sealed class MinecraftLiveSourceSession : IMinecraftPhysicalLineObserver, IDisposable
+public sealed class MinecraftLiveSourceSession : IMinecraftPhysicalLineObserver, IMinecraftWorkspaceLiveSourceSession
 {
     public const long InitialGeneration = 1;
 
