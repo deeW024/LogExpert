@@ -163,32 +163,22 @@ public class NormalizedLogEventContractTests
     }
 
     [Test]
-    public void Normalized_event_keeps_known_fields_unknowns_and_producer_sequence ()
+    public void ReCactus_parser_preserves_location_without_fabricating_producer_sequence ()
     {
         string fixturePath = GetFixturePath("reccactus-session.txt");
         string[] fixtureLines = File.ReadAllLines(fixturePath);
-        string rawText = fixtureLines[1];
-        string[] fields = rawText.Split(',', 5);
-        long startByteOffset = Array.IndexOf(File.ReadAllBytes(fixturePath), (byte)'\n') + 1;
-        string rawTimestamp = fields[0];
-        var result = new NormalizedLogEvent(
-            new EventRef(
-                new FileRef("reccactus", "reccactus-session.txt", 1),
-                1,
-                startByteOffset,
-                startByteOffset + Encoding.UTF8.GetByteCount(rawText),
-                2,
-                2),
-            Attribution.From("Yeezus", AttributionProvenance.Adapter, AttributionConfidence.High),
-            Attribution.From("ReCactus", AttributionProvenance.Adapter, AttributionConfidence.High),
-            Attribution.From(LogLevel.Info, AttributionProvenance.Parsed, AttributionConfidence.High),
-            fields[1],
-            Attribution.Unknown<string>(),
-            EventTimestamp.FromSource(DateTimeOffset.Parse(rawTimestamp, CultureInfo.InvariantCulture), rawTimestamp),
-            EventParseStatus.Parsed,
-            fields[4],
+        string rawText = fixtureLines.Single(line => !line.StartsWith('#'));
+        var file = new FileRef("reccactus", "reccactus-session.txt", 1);
+        var input = new LogParserInput(
+            file,
+            SourceLocalSequence: 1,
+            StartByteOffset: 128,
+            EndByteOffset: 128 + Encoding.UTF8.GetByteCount(rawText),
+            StartLineNumber: 5,
+            EndLineNumber: 5,
             rawText,
-            ProducerSequence: 7);
+            IsComplete: true);
+        NormalizedLogEvent result = new ReCactusSessionTextParser().Parse(input);
 
         Assert.Multiple(() =>
         {
@@ -197,9 +187,16 @@ public class NormalizedLogEventContractTests
             Assert.That(result.Level.Value, Is.EqualTo(LogLevel.Info));
             Assert.That(result.RawLevel, Is.EqualTo("INFO"));
             Assert.That(result.Thread.IsKnown, Is.False);
-            Assert.That(result.ProducerSequence, Is.EqualTo(7));
+            Assert.That(result.ProducerSequence, Is.Null);
+            Assert.That(result.Message, Is.EqualTo("first line\nsecond line\\path"));
+            Assert.That(result.RawText, Is.EqualTo(rawText));
+            Assert.That(result.Ref.File, Is.SameAs(file));
             Assert.That(result.Ref.SourceLocalSequence, Is.EqualTo(1));
-            Assert.That(result.Timestamp.RawValue, Is.EqualTo(rawTimestamp));
+            Assert.That(result.Ref.StartByteOffset, Is.EqualTo(input.StartByteOffset));
+            Assert.That(result.Ref.EndByteOffset, Is.EqualTo(input.EndByteOffset));
+            Assert.That(result.Ref.StartLineNumber, Is.EqualTo(input.StartLineNumber));
+            Assert.That(result.Ref.EndLineNumber, Is.EqualTo(input.EndLineNumber));
+            Assert.That(result.Timestamp.RawValue, Is.EqualTo("2026-09-23T16:41:03.412Z"));
         });
     }
 
