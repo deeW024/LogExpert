@@ -73,6 +73,8 @@ internal sealed class MinecraftWorkspaceLiveCoordinatorTests
         {
             Assert.That(factory.CreatedFileIds, Is.EqualTo(expectedFileIds));
             Assert.That(factory.Sessions.Values.Select(session => session.StartCount), Is.All.EqualTo(1));
+            Assert.That(factory.Sessions.Values.Where(session => session.ReadRequest.ImmutableSnapshot)
+                .Select(session => session.DisposeCount), Is.All.EqualTo(1));
             Assert.That(coordinator.GetRuntimeSources().Select(state => state.Source.FileId), Is.EqualTo(expectedFileIds));
         });
     }
@@ -272,7 +274,9 @@ internal sealed class MinecraftWorkspaceLiveCoordinatorTests
         {
             Assert.That(factory.CreatedFileIds, Has.Count.EqualTo(1));
             Assert.That(factory.GetSession(rotatedPath).StartCount, Is.EqualTo(1));
-            Assert.That(FindState(coordinator, rotatedPath).Status, Is.EqualTo(MinecraftWorkspaceSourceStatus.Active));
+            Assert.That(factory.GetSession(rotatedPath).ReadRequest.ImmutableSnapshot, Is.True);
+            Assert.That(factory.GetSession(rotatedPath).DisposeCount, Is.EqualTo(1));
+            Assert.That(FindState(coordinator, rotatedPath).Status, Is.EqualTo(MinecraftWorkspaceSourceStatus.ImmutableComplete));
         });
     }
 
@@ -298,6 +302,73 @@ internal sealed class MinecraftWorkspaceLiveCoordinatorTests
     }
 
     [Test]
+    public async Task Handoff_short_or_failed_successor_keeps_checkpoint_for_a_nonzero_retry ()
+    {
+        string primaryPath = CreateFile("logs/yeezus.log", "primary");
+        DiscoveredSourceFile primary = GetSource(primaryPath);
+        var factory = new FakeSessionFactory();
+        using var coordinator = CreateCoordinator(factory);
+        coordinator.Reconcile();
+
+        string rotatedPath = CreateFile("logs/yeezus.log.1", "x");
+        DiscoveredSourceFile rotated = GetSource(rotatedPath);
+        var checkpoint = new MinecraftSourceHandoffCheckpoint(
+            primary.SourceId,
+            new FileRef(primary.FileId, primary.FullPath, 1),
+            primary.AdapterHint,
+            primary.SegmentRole,
+            ConsumedByteFrontier: 24,
+            NextPhysicalLineNumber: 6,
+            ReplayStartByteOffset: 12,
+            ReplayStartPhysicalLineNumber: 3,
+            ReplayStartsBeforeConsumedFrontier: true,
+            HasUnemittedState: true,
+            NextSourceLocalSequence: 9);
+        factory.GetSession(primaryPath).RaiseHandoffCheckpoint(new MinecraftWorkspaceHandoffCheckpointEventArgs(
+            MinecraftHandoffTransitionKind.YeezusPrimaryToRotated,
+            checkpoint,
+            predecessorFileLength: 24,
+            successorFileLength: 1));
+
+        coordinator.Reconcile();
+        MinecraftWorkspaceSourceRuntimeState tooShort = FindState(coordinator, rotatedPath);
+        Assert.Multiple(() =>
+        {
+            Assert.That(tooShort.Status, Is.EqualTo(MinecraftWorkspaceSourceStatus.HandoffFaulted));
+            Assert.That(tooShort.Reason, Is.EqualTo(MinecraftWorkspaceSourceReason.SuccessorTooShort));
+            Assert.That(tooShort.Checkpoint, Is.EqualTo(checkpoint));
+            Assert.That(factory.CreatedFileIds, Is.EqualTo(new[] { primary.FileId }));
+        });
+
+        await File.WriteAllTextAsync(rotatedPath, new string('x', 24), Utf8).ConfigureAwait(false);
+        factory.StartFailurePaths.Add(rotatedPath);
+        coordinator.Reconcile();
+        MinecraftWorkspaceSourceRuntimeState failedStart = FindState(coordinator, rotatedPath);
+        Assert.Multiple(() =>
+        {
+            Assert.That(failedStart.Status, Is.EqualTo(MinecraftWorkspaceSourceStatus.HandoffFaulted));
+            Assert.That(failedStart.Checkpoint, Is.EqualTo(checkpoint));
+            Assert.That(factory.ReadRequestsByPath[rotatedPath].StartByteOffset, Is.EqualTo(12));
+            Assert.That(factory.ReadRequestsByPath[rotatedPath].StartPhysicalLineNumber, Is.EqualTo(3));
+            Assert.That(factory.ReadRequestsByPath[rotatedPath].InitialSourceLocalSequence, Is.EqualTo(9));
+            Assert.That(factory.ReadRequestsByPath[rotatedPath].ImmutableSnapshot, Is.True);
+        });
+
+        factory.StartFailurePaths.Remove(rotatedPath);
+        coordinator.Reconcile();
+        coordinator.Reconcile();
+        MinecraftWorkspaceSourceRuntimeState retried = FindState(coordinator, rotatedPath);
+        Assert.Multiple(() =>
+        {
+            Assert.That(retried.Status, Is.EqualTo(MinecraftWorkspaceSourceStatus.ImmutableComplete));
+            Assert.That(retried.Checkpoint, Is.EqualTo(checkpoint));
+            Assert.That(factory.ReadRequestsByPath[rotatedPath].StartByteOffset, Is.EqualTo(12));
+            Assert.That(factory.ReadRequestsByPath[rotatedPath].InitialSourceLocalSequence, Is.EqualTo(9));
+            Assert.That(factory.CreatedFileIds.Count(id => id == rotated.FileId), Is.EqualTo(2));
+        });
+    }
+
+    [Test]
     public void Historical_cfm_final_present_at_startup_may_start ()
     {
         string finalPath = CreateFile("cactusmonitor/sessions/cfm-history.jsonl");
@@ -310,7 +381,9 @@ internal sealed class MinecraftWorkspaceLiveCoordinatorTests
         {
             Assert.That(factory.CreatedFileIds, Has.Count.EqualTo(1));
             Assert.That(factory.GetSession(finalPath).StartCount, Is.EqualTo(1));
-            Assert.That(FindState(coordinator, finalPath).Status, Is.EqualTo(MinecraftWorkspaceSourceStatus.Active));
+            Assert.That(factory.GetSession(finalPath).ReadRequest.ImmutableSnapshot, Is.True);
+            Assert.That(factory.GetSession(finalPath).DisposeCount, Is.EqualTo(1));
+            Assert.That(FindState(coordinator, finalPath).Status, Is.EqualTo(MinecraftWorkspaceSourceStatus.ImmutableComplete));
         });
     }
 
@@ -334,9 +407,10 @@ internal sealed class MinecraftWorkspaceLiveCoordinatorTests
         Assert.Multiple(() =>
         {
             Assert.That(partSession.DisposeCount, Is.EqualTo(1));
-            Assert.That(final.Status, Is.EqualTo(MinecraftWorkspaceSourceStatus.DeferredHandoff));
-            Assert.That(final.Reason, Is.EqualTo(MinecraftWorkspaceSourceReason.RequiresSegmentHandoff));
-            Assert.That(factory.CreatedFileIds, Has.Count.EqualTo(1), "the Final successor must not be read from byte zero");
+            Assert.That(final.Status, Is.EqualTo(MinecraftWorkspaceSourceStatus.ImmutableComplete));
+            Assert.That(factory.CreatedFileIds, Has.Count.EqualTo(2));
+            Assert.That(factory.ReadRequestsByPath[finalPath].ImmutableSnapshot, Is.True);
+            Assert.That(factory.ReadRequestsByPath[finalPath].StartByteOffset, Is.Zero);
             Assert.That(events.Select(item => item.Event.Message), Is.EqualTo(new[] { "part-final" }));
             Assert.That(coordinator.GetRuntimeSources().Any(state => state.Source.FileId == partSource.FileId), Is.False);
         });
@@ -392,8 +466,8 @@ internal sealed class MinecraftWorkspaceLiveCoordinatorTests
     {
         const string initialAlpha = "{\"type\":\"CYCLE\",\"sessionId\":\"alpha\",\"sequence\":1,\"timestampEpochMillis\":1790181663412}\n";
         const string initialBeta = "{\"type\":\"CYCLE\",\"sessionId\":\"beta\",\"sequence\":1,\"timestampEpochMillis\":1790181663412}\n";
-        string alphaPath = CreateFile("cactusmonitor/sessions/cfm-alpha.jsonl", initialAlpha);
-        string betaPath = CreateFile("cactusmonitor/sessions/cfm-beta.jsonl", initialBeta);
+        string alphaPath = CreateFile("cactusmonitor/sessions/cfm-alpha.jsonl.part", initialAlpha);
+        string betaPath = CreateFile("cactusmonitor/sessions/cfm-beta.jsonl.part", initialBeta);
         var discovery = CreateDiscovery();
         var factory = new MinecraftWorkspaceLiveSourceSessionFactory(
             PluginRegistry.PluginRegistry.Instance,
@@ -425,6 +499,211 @@ internal sealed class MinecraftWorkspaceLiveCoordinatorTests
                 "{\"type\":\"CYCLE\",\"sessionId\":\"beta\",\"sequence\":2}"
             }));
         });
+    }
+
+    [Test]
+    public async Task Real_cfm_part_to_final_move_replays_a_pending_line_once ()
+    {
+        const string firstJson = "{\"type\":\"CYCLE\",\"sessionId\":\"cfm-transition\",\"sequence\":1,\"timestampEpochMillis\":1790181663412}";
+        const string secondPrefix = "{\"type\":\"CYCLE\",\"sessionId\":\"cfm-transition\",\"sequence\":2";
+        const string secondSuffix = ",\"timestampEpochMillis\":1790181663413}\n";
+        string partPath = CreateFile("cactusmonitor/sessions/cfm-transition.jsonl.part", firstJson + "\n");
+        var factory = new RecordingRealSessionFactory(
+            PluginRegistry.PluginRegistry.Instance,
+            new EncodingOptions { Encoding = Utf8 },
+            maximumLineLength: 256);
+        using var coordinator = new MinecraftWorkspaceLiveCoordinator(CreateDiscovery(), factory);
+        coordinator.Reconcile();
+
+        await WaitUntil(() => coordinator.PendingCount == 1, "Initial CFM event was not ingressed").ConfigureAwait(false);
+        IReadOnlyList<MinecraftWorkspaceIngressEvent> initial = coordinator.DrainPendingEvents();
+        string finalJson = secondPrefix + secondSuffix.TrimEnd('\n');
+        string finalPath = partPath[..^".part".Length];
+        long secondLineStart = Utf8.GetByteCount(firstJson + "\n");
+
+        await File.AppendAllTextAsync(partPath, secondPrefix, Utf8).ConfigureAwait(false);
+        IMinecraftWorkspaceSourceHandoffSession partSession =
+            (IMinecraftWorkspaceSourceHandoffSession)factory.GetSession(partPath);
+        await WaitUntil(
+            () => partSession.GetHandoffCheckpoint().ConsumedByteFrontier == secondLineStart + Utf8.GetByteCount(secondPrefix),
+            "The active CFM reader did not observe its unterminated final line").ConfigureAwait(false);
+        MinecraftSourceHandoffCheckpoint partialCheckpoint = partSession.GetHandoffCheckpoint();
+
+        await File.AppendAllTextAsync(partPath, secondSuffix, Utf8).ConfigureAwait(false);
+        File.Move(partPath, finalPath);
+        coordinator.Reconcile();
+
+        IReadOnlyList<MinecraftWorkspaceIngressEvent> afterMove = coordinator.DrainPendingEvents();
+        MinecraftWorkspaceSourceRuntimeState finalState = FindState(coordinator, finalPath);
+        MinecraftWorkspaceIngressEvent[] secondEvents = initial.Concat(afterMove)
+            .Where(item => item.Event.RawText == finalJson)
+            .ToArray();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(partialCheckpoint.ReplayStartByteOffset, Is.EqualTo(secondLineStart));
+            Assert.That(partialCheckpoint.ReplayStartPhysicalLineNumber, Is.EqualTo(2));
+            Assert.That(partialCheckpoint.HasUnemittedState, Is.True);
+            Assert.That(finalState.Status, Is.EqualTo(MinecraftWorkspaceSourceStatus.ImmutableComplete));
+            Assert.That(factory.ReadRequestsByPath[finalPath].ImmutableSnapshot, Is.True);
+            Assert.That(factory.ReadRequestsByPath[finalPath].StartByteOffset, Is.EqualTo(secondLineStart));
+            Assert.That(factory.ReadRequestsByPath[finalPath].InitialSourceLocalSequence, Is.EqualTo(2));
+            Assert.That(secondEvents, Has.Length.EqualTo(1));
+            Assert.That(secondEvents[0].Event.Ref.SourceLocalSequence, Is.EqualTo(2));
+            Assert.That(coordinator.PendingCount, Is.Zero);
+        });
+    }
+
+    [Test]
+    public async Task Real_yeezus_rotation_reuses_existing_rotated_file_and_continues_primary_generation ()
+    {
+        const string historyHeader = "2026-09-24T09:59:00+02:00 [INFO] [yeezus] [Client thread] prior rotation";
+        const string firstHeader = "2026-09-24T10:00:00+02:00 [ERROR] [yeezus-core] [Client thread] first";
+        const string firstStack = "    at example.Client.first(Client.java:1)";
+        const string pendingHeader = "2026-09-24T10:00:01+02:00 [ERROR] [yeezus-core] [Client thread] pending";
+        const string newPrimaryHeader = "2026-09-24T10:00:02+02:00 [INFO] [yeezus] [Client thread] new primary";
+        const string nextPrimaryHeader = "2026-09-24T10:00:03+02:00 [INFO] [yeezus] [Client thread] next";
+        string rotatedPath = CreateFile("logs/yeezus.log.1", historyHeader + "\n");
+        string primaryPath = CreateFile("logs/yeezus.log", firstHeader + "\n" + firstStack + "\n" + pendingHeader + "\n");
+        var factory = new RecordingRealSessionFactory(
+            PluginRegistry.PluginRegistry.Instance,
+            new EncodingOptions { Encoding = Utf8 },
+            maximumLineLength: 256);
+        using var coordinator = new MinecraftWorkspaceLiveCoordinator(CreateDiscovery(), factory);
+        coordinator.Reconcile();
+
+        await WaitUntil(() => coordinator.PendingCount >= 2, "Initial Yeezus history and primary events were not ingressed").ConfigureAwait(false);
+        IReadOnlyList<MinecraftWorkspaceIngressEvent> initial = coordinator.DrainPendingEvents();
+        IMinecraftWorkspaceLiveSourceSessionProgress primaryProgress =
+            (IMinecraftWorkspaceLiveSourceSessionProgress)factory.GetSession(primaryPath);
+        Assert.That(primaryProgress.NextSourceLocalSequence, Is.EqualTo(2), "the second primary record is pending");
+
+        File.Delete(rotatedPath);
+        File.Move(primaryPath, rotatedPath);
+        await File.WriteAllTextAsync(primaryPath, newPrimaryHeader + "\n", Utf8).ConfigureAwait(false);
+        await WaitUntil(
+            () => primaryProgress.CurrentFile.Generation == 2,
+            "The primary reader did not continue in its next generation").ConfigureAwait(false);
+        coordinator.Reconcile();
+        DateTimeOffset handoffDeadline = DateTimeOffset.UtcNow.AddSeconds(8);
+        while (DateTimeOffset.UtcNow < handoffDeadline &&
+            factory.ReadRequestsByPath[rotatedPath].InitialSourceLocalSequence != 2)
+        {
+            coordinator.Reconcile();
+            await Task.Delay(20).ConfigureAwait(false);
+        }
+
+        MinecraftWorkspaceSourceRuntimeState handoffAttempt = FindState(coordinator, rotatedPath);
+        Assert.That(
+            factory.ReadRequestsByPath[rotatedPath].InitialSourceLocalSequence,
+            Is.EqualTo(2),
+            $"rotated state={handoffAttempt.Status}/{handoffAttempt.Reason}; checkpoint={handoffAttempt.Checkpoint}");
+
+        MinecraftWorkspaceSourceRuntimeState replayedRotation = FindState(coordinator, rotatedPath);
+        MinecraftSourceHandoffCheckpoint rotationCheckpoint = replayedRotation.Checkpoint!;
+        Assert.That(replayedRotation.Status, Is.EqualTo(MinecraftWorkspaceSourceStatus.ImmutableComplete));
+        Assert.That(rotationCheckpoint.ReplayStartByteOffset, Is.LessThan(rotationCheckpoint.ConsumedByteFrontier));
+        Assert.That(factory.ReadRequestsByPath[rotatedPath].StartByteOffset, Is.EqualTo(Utf8.GetByteCount(firstHeader + "\n" + firstStack + "\n")));
+        Assert.That(factory.ReadRequestsByPath[rotatedPath].InitialSourceLocalSequence, Is.EqualTo(2));
+
+        Assert.That(primaryProgress.NextSourceLocalSequence, Is.EqualTo(3));
+        await File.AppendAllTextAsync(primaryPath, nextPrimaryHeader + "\n", Utf8).ConfigureAwait(false);
+        await WaitUntil(() => coordinator.PendingCount >= 2, "Rotated pending record and continued primary event were not ingressed").ConfigureAwait(false);
+        IReadOnlyList<MinecraftWorkspaceIngressEvent> afterRotation = coordinator.DrainPendingEvents();
+        MinecraftWorkspaceIngressEvent replayedPending = afterRotation.Single(item => item.Event.RawText == pendingHeader);
+        MinecraftWorkspaceIngressEvent newPrimary = afterRotation.Single(item => item.Event.RawText == newPrimaryHeader);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(initial.Any(item => item.Event.RawText == pendingHeader), Is.False);
+            Assert.That(initial.Count(item => item.Event.RawText == firstHeader + "\n" + firstStack), Is.EqualTo(1));
+            Assert.That(replayedPending.FileId, Is.EqualTo(GetSource(rotatedPath).FileId));
+            Assert.That(replayedPending.Event.Ref.File.Generation, Is.EqualTo(2));
+            Assert.That(replayedPending.Event.Ref.SourceLocalSequence, Is.EqualTo(2));
+            Assert.That(newPrimary.FileId, Is.EqualTo(GetSource(primaryPath).FileId));
+            Assert.That(newPrimary.Event.Ref.File.Generation, Is.EqualTo(2));
+            Assert.That(newPrimary.Event.Ref.SourceLocalSequence, Is.EqualTo(3));
+        });
+    }
+
+    [Test]
+    public async Task Real_yeezus_move_gap_captures_pending_state_before_disposing_primary ()
+    {
+        const string historyHeader = "2026-09-24T09:59:00+02:00 [INFO] [yeezus] [Client thread] prior rotation";
+        const string firstHeader = "2026-09-24T10:00:00+02:00 [ERROR] [yeezus-core] [Client thread] first";
+        const string pendingHeader = "2026-09-24T10:00:01+02:00 [ERROR] [yeezus-core] [Client thread] pending";
+        const string nextPrimaryHeader = "2026-09-24T10:00:02+02:00 [INFO] [yeezus] [Client thread] new primary";
+        string rotatedPath = CreateFile("logs/yeezus.log.1", historyHeader + "\n");
+        string primaryPath = CreateFile("logs/yeezus.log", firstHeader + "\n" + pendingHeader + "\n");
+        var factory = new RecordingRealSessionFactory(
+            PluginRegistry.PluginRegistry.Instance,
+            new EncodingOptions { Encoding = Utf8 },
+            maximumLineLength: 256);
+        using var coordinator = new MinecraftWorkspaceLiveCoordinator(CreateDiscovery(), factory);
+        coordinator.Reconcile();
+
+        await WaitUntil(() => coordinator.PendingCount >= 2, "Initial Yeezus history and primary events were not ingressed").ConfigureAwait(false);
+        IReadOnlyList<MinecraftWorkspaceIngressEvent> initial = coordinator.DrainPendingEvents();
+        long replayStart = Utf8.GetByteCount(firstHeader + "\n");
+
+        File.Delete(rotatedPath);
+        File.Move(primaryPath, rotatedPath);
+        coordinator.Reconcile();
+
+        MinecraftWorkspaceSourceRuntimeState replayedRotation = FindState(coordinator, rotatedPath);
+        MinecraftWorkspaceIngressEvent replayedPending = coordinator.DrainPendingEvents()
+            .Single(item => item.Event.RawText == pendingHeader);
+        Assert.Multiple(() =>
+        {
+            Assert.That(replayedRotation.Status, Is.EqualTo(MinecraftWorkspaceSourceStatus.ImmutableComplete));
+            Assert.That(replayedRotation.Checkpoint?.ReplayStartByteOffset, Is.EqualTo(replayStart));
+            Assert.That(factory.ReadRequestsByPath[rotatedPath].StartByteOffset, Is.EqualTo(replayStart));
+            Assert.That(factory.ReadRequestsByPath[rotatedPath].InitialSourceLocalSequence, Is.EqualTo(2));
+            Assert.That(initial.Any(item => item.Event.RawText == pendingHeader), Is.False);
+            Assert.That(replayedPending.FileId, Is.EqualTo(GetSource(rotatedPath).FileId));
+            Assert.That(replayedPending.Event.Ref.SourceLocalSequence, Is.EqualTo(2));
+        });
+
+        await File.WriteAllTextAsync(primaryPath, nextPrimaryHeader + "\n", Utf8).ConfigureAwait(false);
+        coordinator.Reconcile();
+        IMinecraftWorkspaceLiveSourceSessionProgress continuedPrimary =
+            (IMinecraftWorkspaceLiveSourceSessionProgress)factory.GetSession(primaryPath);
+        Assert.That(continuedPrimary.CurrentFile.Generation, Is.EqualTo(2));
+        Assert.That(continuedPrimary.NextSourceLocalSequence, Is.EqualTo(3));
+    }
+
+    private sealed class RecordingRealSessionFactory :
+        IMinecraftWorkspaceLiveSourceSessionFactory,
+        IMinecraftWorkspaceLiveSourceSessionFactoryWithReadRequest
+    {
+        private readonly MinecraftWorkspaceLiveSourceSessionFactory _inner;
+
+        public RecordingRealSessionFactory (
+            IPluginRegistry pluginRegistry,
+            EncodingOptions encodingOptions,
+            int maximumLineLength)
+        {
+            _inner = new MinecraftWorkspaceLiveSourceSessionFactory(pluginRegistry, encodingOptions, maximumLineLength);
+        }
+
+        public Dictionary<string, IMinecraftWorkspaceLiveSourceSession> Sessions { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+        public Dictionary<string, MinecraftWorkspaceSourceReadRequest> ReadRequestsByPath { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+        public IMinecraftWorkspaceLiveSourceSession Create (DiscoveredSourceFile source) =>
+            Create(source, MinecraftWorkspaceSourceReadRequest.Live());
+
+        public IMinecraftWorkspaceLiveSourceSession Create (
+            DiscoveredSourceFile source,
+            MinecraftWorkspaceSourceReadRequest readRequest)
+        {
+            IMinecraftWorkspaceLiveSourceSession session = _inner.Create(source, readRequest);
+            Sessions[source.FullPath] = session;
+            ReadRequestsByPath[source.FullPath] = readRequest;
+            return session;
+        }
+
+        public IMinecraftWorkspaceLiveSourceSession GetSession (string path) => Sessions[path];
     }
 
     private MinecraftWorkspaceLiveCoordinator CreateCoordinator (FakeSessionFactory factory) =>
@@ -489,7 +768,9 @@ internal sealed class MinecraftWorkspaceLiveCoordinatorTests
         Assert.Fail(failureMessage);
     }
 
-    private sealed class FakeSessionFactory : IMinecraftWorkspaceLiveSourceSessionFactory
+    private sealed class FakeSessionFactory :
+        IMinecraftWorkspaceLiveSourceSessionFactory,
+        IMinecraftWorkspaceLiveSourceSessionFactoryWithReadRequest
     {
         public List<string> CreatedFileIds { get; } = [];
 
@@ -499,7 +780,16 @@ internal sealed class MinecraftWorkspaceLiveCoordinatorTests
 
         public Dictionary<string, FakeSession> Sessions { get; } = new(StringComparer.OrdinalIgnoreCase);
 
+        public Dictionary<string, MinecraftWorkspaceSourceReadRequest> ReadRequestsByPath { get; } = new(StringComparer.OrdinalIgnoreCase);
+
         public IMinecraftWorkspaceLiveSourceSession Create (DiscoveredSourceFile source)
+        {
+            return Create(source, MinecraftWorkspaceSourceReadRequest.Live());
+        }
+
+        public IMinecraftWorkspaceLiveSourceSession Create (
+            DiscoveredSourceFile source,
+            MinecraftWorkspaceSourceReadRequest readRequest)
         {
             CreatedFileIds.Add(source.FileId);
             if (CreationFailurePaths.Contains(source.FullPath))
@@ -507,17 +797,27 @@ internal sealed class MinecraftWorkspaceLiveCoordinatorTests
                 throw new IOException();
             }
 
-            var session = new FakeSession { FailStart = StartFailurePaths.Contains(source.FullPath) };
+            var session = new FakeSession
+            {
+                FailStart = StartFailurePaths.Contains(source.FullPath),
+                ReadRequest = readRequest,
+                Source = source
+            };
             Sessions[source.FullPath] = session;
+            ReadRequestsByPath[source.FullPath] = readRequest;
             return session;
         }
 
         public FakeSession GetSession (string path) => Sessions[path];
     }
 
-    private sealed class FakeSession : IMinecraftWorkspaceLiveSourceSession
+    private sealed class FakeSession :
+        IMinecraftWorkspaceLiveSourceSession,
+        IMinecraftWorkspaceSourceHandoffSession
     {
         public event EventHandler<MinecraftLiveSourceEventsProducedEventArgs>? EventsProduced;
+
+        public event EventHandler<MinecraftWorkspaceHandoffCheckpointEventArgs>? HandoffCheckpointCaptured;
 
         public int StartCount { get; private set; }
 
@@ -525,7 +825,13 @@ internal sealed class MinecraftWorkspaceLiveCoordinatorTests
 
         public bool FailStart { get; init; }
 
+        public MinecraftWorkspaceSourceReadRequest ReadRequest { get; init; } = MinecraftWorkspaceSourceReadRequest.Live();
+
+        public DiscoveredSourceFile Source { get; init; } = null!;
+
         public IReadOnlyList<NormalizedLogEvent> FinalEvents { get; set; } = Array.Empty<NormalizedLogEvent>();
+
+        public MinecraftSourceHandoffCheckpoint? Checkpoint { get; private set; }
 
         public void StartMonitoring ()
         {
@@ -538,6 +844,27 @@ internal sealed class MinecraftWorkspaceLiveCoordinatorTests
 
         public void Emit (NormalizedLogEvent parsedEvent) =>
             EventsProduced?.Invoke(this, new MinecraftLiveSourceEventsProducedEventArgs([parsedEvent]));
+
+        public MinecraftSourceHandoffCheckpoint GetHandoffCheckpoint () => Checkpoint ?? new MinecraftSourceHandoffCheckpoint(
+            Source.SourceId,
+            new FileRef(Source.FileId, Source.FullPath, ReadRequest.InitialGeneration),
+            Source.AdapterHint,
+            Source.SegmentRole,
+            ConsumedByteFrontier: 0,
+            NextPhysicalLineNumber: 1,
+            ReplayStartByteOffset: 0,
+            ReplayStartPhysicalLineNumber: 1,
+            ReplayStartsBeforeConsumedFrontier: false,
+            HasUnemittedState: false,
+            NextSourceLocalSequence: ReadRequest.InitialSourceLocalSequence);
+
+        public MinecraftSourceHandoffCheckpoint CaptureAndCloseForHandoff () => GetHandoffCheckpoint();
+
+        public void RaiseHandoffCheckpoint (MinecraftWorkspaceHandoffCheckpointEventArgs args)
+        {
+            Checkpoint = args.Checkpoint;
+            HandoffCheckpointCaptured?.Invoke(this, args);
+        }
 
         public void Dispose ()
         {

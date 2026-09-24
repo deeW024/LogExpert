@@ -86,6 +86,63 @@ public sealed class MinecraftLogRecordFramerTests
     }
 
     [Test]
+    public void Line_delimited_replay_checkpoint_starts_at_pending_partial_line_and_is_read_only ()
+    {
+        FileRef file = CreateFile();
+        var framer = new GenerationAwareLogicalRecordFramer(MinecraftSourceAdapterHint.CactusMonitorSessionJsonl);
+        framer.BeginGeneration(file);
+        const string partial = "{\"type\":\"CYCLE\",\"sequence\":";
+        const string complete = partial + "8}";
+        PhysicalLineObservation pending = CreateLine(file, 4, 90, partial, PhysicalLineTerminator.None);
+        framer.Accept(pending);
+
+        LogicalRecordReplayStart checkpoint = framer.GetReplayStart(pending.EndByteOffset, nextPhysicalLineNumber: 4);
+        LogicalRecordReplayStart repeated = framer.GetReplayStart(pending.EndByteOffset, nextPhysicalLineNumber: 4);
+        IReadOnlyList<LogParserInput> completed = framer.Accept(
+            CreateLine(file, 4, 90, complete, PhysicalLineTerminator.Lf));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(checkpoint, Is.EqualTo(repeated));
+            Assert.That(checkpoint.ByteOffset, Is.EqualTo(90));
+            Assert.That(checkpoint.PhysicalLineNumber, Is.EqualTo(4));
+            Assert.That(checkpoint.HasUnemittedState, Is.True);
+            Assert.That(completed, Has.Count.EqualTo(1));
+            Assert.That(completed[0].RawText, Is.EqualTo(complete));
+            Assert.That(completed[0].SourceLocalSequence, Is.EqualTo(1));
+        });
+    }
+
+    [Test]
+    public void Header_delimited_replay_checkpoint_starts_at_pending_event_header_without_finalizing_it ()
+    {
+        FileRef file = CreateFile();
+        var framer = new GenerationAwareLogicalRecordFramer(MinecraftSourceAdapterHint.YeezusTextLog);
+        framer.BeginGeneration(file);
+        const string header = "2026-09-24T10:00:00+02:00 [ERROR] [yeezus-core] [Client thread] failed";
+        const string stack = "    at example.Client.tick(Client.java:1)";
+        const string nextHeader = "2026-09-24T10:00:01+02:00 [INFO] [yeezus] [Client thread] recovered";
+        PhysicalLineObservation first = CreateLine(file, 20, 100, header, PhysicalLineTerminator.CrLf);
+        PhysicalLineObservation second = CreateLine(file, 21, NextStart(first), stack, PhysicalLineTerminator.Lf);
+        PhysicalLineObservation third = CreateLine(file, 22, NextStart(second), nextHeader, PhysicalLineTerminator.Lf);
+        framer.Accept(first);
+        framer.Accept(second);
+
+        LogicalRecordReplayStart checkpoint = framer.GetReplayStart(NextStart(second), nextPhysicalLineNumber: 22);
+        IReadOnlyList<LogParserInput> closed = framer.Accept(third);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(checkpoint.ByteOffset, Is.EqualTo(first.StartByteOffset));
+            Assert.That(checkpoint.PhysicalLineNumber, Is.EqualTo(first.LineNumber));
+            Assert.That(checkpoint.HasUnemittedState, Is.True);
+            Assert.That(closed, Has.Count.EqualTo(1));
+            Assert.That(closed[0].RawText, Is.EqualTo(header + "\r\n" + stack));
+            Assert.That(closed[0].SourceLocalSequence, Is.EqualTo(1));
+        });
+    }
+
+    [Test]
     public void Finalizing_an_unterminated_line_emits_one_partial_record_for_the_parser ()
     {
         FileRef file = CreateFile();

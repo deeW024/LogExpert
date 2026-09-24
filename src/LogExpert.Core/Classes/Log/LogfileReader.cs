@@ -53,6 +53,7 @@ public partial class LogfileReader : ILogfileReader, IMultiFileNavigation, ILogf
     private bool _disposed;
     private ILogFileInfo _watchedILogFileInfo;
     private IMinecraftPhysicalLineObserver? _minecraftPhysicalLineObserver;
+    private long _minecraftPhysicalLineReadStartByteOffset;
 
     private volatile bool _isFailModeCheckCallPending;
     private volatile bool _isFastFailOnGetLogLine;
@@ -259,6 +260,25 @@ public partial class LogfileReader : ILogfileReader, IMultiFileNavigation, ILogf
     /// </summary>
     public long FileSize { get; private set; }
 
+    /// <summary>Initial byte position for an exact-metadata Minecraft physical-line read.</summary>
+    public long MinecraftPhysicalLineReadStartByteOffset
+    {
+        get => _minecraftPhysicalLineReadStartByteOffset;
+        set
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(value);
+            if (FileSize != 0)
+            {
+                throw new InvalidOperationException();
+            }
+
+            _minecraftPhysicalLineReadStartByteOffset = value;
+        }
+    }
+
+    /// <summary>Whether the most recent file read found the watched source unavailable.</summary>
+    public bool IsFileUnavailable => _isDeleted;
+
     /// <summary>
     /// Gets or sets a value indicating whether XML mode is enabled.
     /// </summary>
@@ -342,12 +362,18 @@ public partial class LogfileReader : ILogfileReader, IMultiFileNavigation, ILogf
             BufferIndex.ClearLru(_bufferPool);
 
             ILogFileInfo lastReadableFile = null;
+            bool firstFile = true;
             foreach (var info in _logFileInfoList)
             {
-                if (ReadToBufferList(info, 0, LineCount))
+                long filePosition = firstFile && _minecraftPhysicalLineObserver is not null
+                    ? _minecraftPhysicalLineReadStartByteOffset
+                    : 0;
+                if (ReadToBufferList(info, filePosition, LineCount))
                 {
                     lastReadableFile = info;
                 }
+
+                firstFile = false;
             }
 
             if (_logFileInfoList.Count > 0)
@@ -1559,6 +1585,7 @@ public partial class LogfileReader : ILogfileReader, IMultiFileNavigation, ILogf
             {
                 if (_watchedILogFileInfo.FileHasChanged())
                 {
+                    long previouslyObservedFileLength = _fileLength;
                     _fileLength = _watchedILogFileInfo.Length;
                     if (_fileLength == -1)
                     {
@@ -1566,7 +1593,7 @@ public partial class LogfileReader : ILogfileReader, IMultiFileNavigation, ILogf
                     }
                     else
                     {
-                        FileChanged();
+                        FileChanged(previouslyObservedFileLength);
                     }
                 }
             }
@@ -1614,7 +1641,7 @@ public partial class LogfileReader : ILogfileReader, IMultiFileNavigation, ILogf
     /// previously deleted and has been restored, the method triggers a respawn event and resets the file size. It also
     /// logs the change and notifies listeners of the update.
     /// </remarks>
-    private void FileChanged ()
+    private void FileChanged (long previouslyObservedFileLength)
     {
         if (_isDeleted)
         {
@@ -1628,7 +1655,7 @@ public partial class LogfileReader : ILogfileReader, IMultiFileNavigation, ILogf
         //if (this.currFileSize != newSize)
         {
             _logger.Info(CultureInfo.InvariantCulture, "file size changed. new size={0}, file: {1}", newSize, _fileName);
-            FireChangeEvent();
+            FireChangeEvent(previouslyObservedFileLength);
         }
     }
 
@@ -1642,7 +1669,7 @@ public partial class LogfileReader : ILogfileReader, IMultiFileNavigation, ILogf
     /// appropriate. Listeners can use the event data to respond to file changes, such as updating UI elements or
     /// processing new log entries.
     /// </remarks>
-    private void FireChangeEvent ()
+    private void FireChangeEvent (long previouslyObservedFileLength)
     {
         LogEventArgs args = new()
         {
@@ -1653,7 +1680,7 @@ public partial class LogfileReader : ILogfileReader, IMultiFileNavigation, ILogf
         var newSize = _fileLength;
         if (newSize < FileSize && !_isDeleted)
         {
-            _minecraftPhysicalLineObserver?.OnSourceTruncated();
+            _minecraftPhysicalLineObserver?.OnSourceTruncated(previouslyObservedFileLength);
         }
 
         if (newSize < FileSize || _isDeleted)

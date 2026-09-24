@@ -1,19 +1,25 @@
 namespace LogExpert.Core.Classes.MinecraftLogs;
 
-#pragma warning disable CA1031 // Per-source creation, start, and teardown failures must stay isolated.
+#pragma warning disable CA1031 // Per-source creation, start, handoff, and teardown failures stay isolated.
 
 public enum MinecraftWorkspaceSourceStatus
 {
     Active,
+    ImmutableComplete,
     DeferredHandoff,
+    HandoffFaulted,
     Faulted
 }
 
 public enum MinecraftWorkspaceSourceReason
 {
     RequiresSegmentHandoff,
+    SuccessorTooShort,
+    UnsafeSuccessorLength,
+    AmbiguousHandoff,
     SessionCreationFailed,
-    SessionStartFailed
+    SessionStartFailed,
+    HandoffStartFailed
 }
 
 /// <summary>Immutable runtime state for one discovered physical source.</summary>
@@ -21,7 +27,10 @@ public sealed record MinecraftWorkspaceSourceRuntimeState (
     DiscoveredSourceFile Source,
     MinecraftWorkspaceSourceStatus Status,
     MinecraftWorkspaceSourceReason? Reason,
-    long EmittedEventCount);
+    long EmittedEventCount,
+    long Generation = 1,
+    long NextSourceLocalSequence = 1,
+    MinecraftSourceHandoffCheckpoint? Checkpoint = null);
 
 /// <summary>An immutable event envelope in workspace ingress order.</summary>
 public sealed record MinecraftWorkspaceIngressEvent (
@@ -45,6 +54,9 @@ public sealed class MinecraftWorkspaceLiveCoordinator : IDisposable
     private readonly object _gate = new();
     private readonly Dictionary<string, SourceHandle> _sessions = new(StringComparer.Ordinal);
     private readonly Dictionary<string, MinecraftWorkspaceSourceRuntimeState> _sources = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, SourceProgress> _fileProgress = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, PendingHandoff> _pendingCfmHandoffs = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, PendingHandoff> _pendingYeezusHandoffs = new(StringComparer.Ordinal);
     private readonly HashSet<string> _observedActivePartSourceIds = new(StringComparer.Ordinal);
     private readonly HashSet<string> _activatedPrimarySourceIds = new(StringComparer.Ordinal);
     private readonly Queue<MinecraftWorkspaceIngressEvent> _pendingEvents = new();
@@ -108,7 +120,24 @@ public sealed class MinecraftWorkspaceLiveCoordinator : IDisposable
 
             foreach (SourceHandle handle in disappearedSessions)
             {
-                DisposeHandle(handle, removeRuntimeState: true);
+                if (handle.Source.Family == MinecraftSourceFamily.CactusMonitor &&
+                    handle.Source.SegmentRole == MinecraftSourceSegmentRole.ActivePart)
+                {
+                    CaptureCfmHandoffAndDispose(handle);
+                }
+                else if (handle.Source.Family == MinecraftSourceFamily.Yeezus &&
+                    handle.Source.SegmentRole == MinecraftSourceSegmentRole.Primary &&
+                    snapshot.Files.Any(source =>
+                        source.Family == MinecraftSourceFamily.Yeezus &&
+                        source.SegmentRole == MinecraftSourceSegmentRole.Rotated &&
+                        source.SourceId == handle.Source.SourceId))
+                {
+                    CaptureYeezusHandoffAndDispose(handle);
+                }
+                else
+                {
+                    DisposeHandle(handle, removeRuntimeState: true);
+                }
             }
 
             lock (_gate)
@@ -117,12 +146,16 @@ public sealed class MinecraftWorkspaceLiveCoordinator : IDisposable
                 {
                     _sources.Remove(fileId);
                 }
+
+                RemoveMissingSuccessors(_pendingCfmHandoffs, presentFileIds);
+                RemoveMissingSuccessors(_pendingYeezusHandoffs, presentFileIds);
             }
 
-            // Discovery already returns a stable path order. Do not reorder by timestamps or
-            // logical source identity; initial startup must follow that exact physical order.
-            // Faulted state is retained while a FileId stays present, so unchanged rescans do
-            // not retry. An observed disappearance clears it and a later appearance gets one retry.
+            ProcessPendingYeezusHandoffs(snapshot.Files);
+            ProcessPendingCfmHandoffs(snapshot.Files);
+
+            // Discovery already returns a stable path order. Historical Rotated/Final
+            // segments start as immutable reads on the first snapshot.
             foreach (DiscoveredSourceFile source in snapshot.Files)
             {
                 lock (_gate)
@@ -135,19 +168,16 @@ public sealed class MinecraftWorkspaceLiveCoordinator : IDisposable
 
                 if (RequiresDeferredHandoff(source, isInitialSnapshot, observedActiveParts, activatedPrimaries))
                 {
-                    lock (_gate)
-                    {
-                        _sources[source.FileId] = new MinecraftWorkspaceSourceRuntimeState(
-                            source,
-                            MinecraftWorkspaceSourceStatus.DeferredHandoff,
-                            MinecraftWorkspaceSourceReason.RequiresSegmentHandoff,
-                            EmittedEventCount: 0);
-                    }
-
+                    SetRuntimeState(
+                        source,
+                        MinecraftWorkspaceSourceStatus.DeferredHandoff,
+                        MinecraftWorkspaceSourceReason.RequiresSegmentHandoff,
+                        emittedEventCount: 0);
                     continue;
                 }
 
-                StartSource(source);
+                MinecraftWorkspaceSourceReadRequest readRequest = CreateDefaultReadRequest(source);
+                StartSource(source, readRequest, checkpoint: null);
             }
 
             lock (_gate)
@@ -166,7 +196,7 @@ public sealed class MinecraftWorkspaceLiveCoordinator : IDisposable
         }
     }
 
-    /// <summary>Returns a stable immutable snapshot of current active, deferred, and faulted sources.</summary>
+    /// <summary>Returns a stable immutable snapshot of current active, completed, deferred, and faulted sources.</summary>
     public IReadOnlyList<MinecraftWorkspaceSourceRuntimeState> GetRuntimeSources ()
     {
         lock (_gate)
@@ -225,28 +255,232 @@ public sealed class MinecraftWorkspaceLiveCoordinator : IDisposable
             lock (_gate)
             {
                 _sources.Clear();
+                _pendingCfmHandoffs.Clear();
+                _pendingYeezusHandoffs.Clear();
                 _disposeComplete = true;
             }
         }
     }
 
-    private void StartSource (DiscoveredSourceFile source)
+    private void CaptureCfmHandoffAndDispose (SourceHandle handle)
+    {
+        MinecraftSourceHandoffCheckpoint? checkpoint = null;
+        if (handle.Session is IMinecraftWorkspaceSourceHandoffSession handoffSession)
+        {
+            try
+            {
+                checkpoint = handoffSession.CaptureAndCloseForHandoff();
+            }
+            catch (Exception)
+            {
+                // A checkpoint already captured by the reader callback remains usable.
+            }
+        }
+
+        if (checkpoint is not null)
+        {
+            StorePendingHandoff(
+                _pendingCfmHandoffs,
+                handle.Source.SourceId,
+                new PendingHandoff(
+                    checkpoint,
+                    checkpoint.ConsumedByteFrontier,
+                    SuccessorLengthAtBoundary: null,
+                    SuccessorFileId: null,
+                    IsAmbiguous: false));
+        }
+
+        DisposeHandle(handle, removeRuntimeState: true);
+    }
+
+    private void CaptureYeezusHandoffAndDispose (SourceHandle handle)
+    {
+        MinecraftSourceHandoffCheckpoint? checkpoint = null;
+        if (handle.Session is IMinecraftWorkspaceSourceHandoffSession handoffSession)
+        {
+            try
+            {
+                checkpoint = handoffSession.CaptureAndCloseForHandoff();
+            }
+            catch (Exception)
+            {
+                // The reader callback may already have captured the checkpoint.
+            }
+        }
+
+        if (checkpoint is not null)
+        {
+            StorePendingHandoff(
+                _pendingYeezusHandoffs,
+                handle.Source.SourceId,
+                new PendingHandoff(
+                    checkpoint,
+                    checkpoint.ConsumedByteFrontier,
+                    SuccessorLengthAtBoundary: null,
+                    SuccessorFileId: null,
+                    IsAmbiguous: false));
+        }
+
+        DisposeHandle(handle, removeRuntimeState: true);
+    }
+
+    private void ProcessPendingYeezusHandoffs (IReadOnlyList<DiscoveredSourceFile> discoveredFiles)
+    {
+        PendingHandoffEntry[] pending;
+        lock (_gate)
+        {
+            pending = _pendingYeezusHandoffs
+                .Select(pair => new PendingHandoffEntry(pair.Key, pair.Value))
+                .ToArray();
+        }
+
+        foreach (PendingHandoffEntry entry in pending)
+        {
+            DiscoveredSourceFile? successor = discoveredFiles.FirstOrDefault(source =>
+                source.Family == MinecraftSourceFamily.Yeezus &&
+                source.SegmentRole == MinecraftSourceSegmentRole.Rotated &&
+                source.SourceId == entry.Pending.Checkpoint.SourceId);
+            if (successor is null)
+            {
+                continue;
+            }
+
+            PendingHandoff current = entry.Pending with { SuccessorFileId = successor.FileId };
+            StorePendingHandoff(_pendingYeezusHandoffs, entry.Key, current);
+            if (current.IsAmbiguous)
+            {
+                SetHandoffFaulted(successor, current.Checkpoint, MinecraftWorkspaceSourceReason.AmbiguousHandoff);
+                continue;
+            }
+
+            long? successorLength = TryGetLength(successor.FullPath);
+            long requiredLength = Math.Max(
+                current.Checkpoint.ConsumedByteFrontier,
+                current.PredecessorObservedLength);
+            if (current.SuccessorLengthAtBoundary is long boundaryLength)
+            {
+                requiredLength = Math.Max(requiredLength, boundaryLength);
+            }
+            if (successorLength is null || successorLength < requiredLength ||
+                successorLength < current.Checkpoint.ReplayStartByteOffset)
+            {
+                MinecraftWorkspaceSourceReason reason = successorLength is not null &&
+                    successorLength < Math.Max(requiredLength, current.Checkpoint.ReplayStartByteOffset)
+                        ? MinecraftWorkspaceSourceReason.SuccessorTooShort
+                        : MinecraftWorkspaceSourceReason.UnsafeSuccessorLength;
+                SetHandoffFaulted(successor, current.Checkpoint, reason);
+                continue;
+            }
+
+            MinecraftWorkspaceSourceReadRequest readRequest = CreateHandoffReadRequest(successor, current.Checkpoint);
+            if (StartSource(successor, readRequest, current.Checkpoint))
+            {
+                RemovePending(_pendingYeezusHandoffs, entry.Key, current);
+            }
+        }
+    }
+
+    private void ProcessPendingCfmHandoffs (IReadOnlyList<DiscoveredSourceFile> discoveredFiles)
+    {
+        PendingHandoffEntry[] pending;
+        lock (_gate)
+        {
+            pending = _pendingCfmHandoffs
+                .Select(pair => new PendingHandoffEntry(pair.Key, pair.Value))
+                .ToArray();
+        }
+
+        foreach (PendingHandoffEntry entry in pending)
+        {
+            DiscoveredSourceFile? successor = discoveredFiles.FirstOrDefault(source =>
+                source.Family == MinecraftSourceFamily.CactusMonitor &&
+                source.SegmentRole == MinecraftSourceSegmentRole.Final &&
+                source.SourceId == entry.Pending.Checkpoint.SourceId);
+            if (successor is null)
+            {
+                continue;
+            }
+
+            PendingHandoff current = entry.Pending with { SuccessorFileId = successor.FileId };
+            StorePendingHandoff(_pendingCfmHandoffs, entry.Key, current);
+            if (current.IsAmbiguous)
+            {
+                SetHandoffFaulted(successor, current.Checkpoint, MinecraftWorkspaceSourceReason.AmbiguousHandoff);
+                continue;
+            }
+
+            long? successorLength = TryGetLength(successor.FullPath);
+            long requiredLength = Math.Max(
+                current.Checkpoint.ConsumedByteFrontier,
+                current.Checkpoint.ReplayStartByteOffset);
+            if (successorLength is null || successorLength < requiredLength)
+            {
+                SetHandoffFaulted(
+                    successor,
+                    current.Checkpoint,
+                    successorLength is not null
+                        ? MinecraftWorkspaceSourceReason.SuccessorTooShort
+                        : MinecraftWorkspaceSourceReason.UnsafeSuccessorLength);
+                continue;
+            }
+
+            MinecraftWorkspaceSourceReadRequest readRequest = CreateHandoffReadRequest(successor, current.Checkpoint);
+            if (StartSource(successor, readRequest, current.Checkpoint))
+            {
+                RemovePending(_pendingCfmHandoffs, entry.Key, current);
+            }
+        }
+    }
+
+    private bool StartSource (
+        DiscoveredSourceFile source,
+        MinecraftWorkspaceSourceReadRequest requestedReadRequest,
+        MinecraftSourceHandoffCheckpoint? checkpoint)
     {
         IMinecraftWorkspaceLiveSourceSession? session = null;
         SourceHandle? handle = null;
         bool created = false;
+        bool acceptsReadRequest = _sessionFactory is IMinecraftWorkspaceLiveSourceSessionFactoryWithReadRequest;
+        bool immutableSnapshot = requestedReadRequest.ImmutableSnapshot && acceptsReadRequest;
+
+        if ((checkpoint is not null || requestedReadRequest.ImmutableSnapshot) && !acceptsReadRequest)
+        {
+            if (checkpoint is not null)
+            {
+                SetHandoffFaulted(source, checkpoint, MinecraftWorkspaceSourceReason.HandoffStartFailed);
+            }
+            else
+            {
+                SetRuntimeState(
+                    source,
+                    MinecraftWorkspaceSourceStatus.Faulted,
+                    MinecraftWorkspaceSourceReason.SessionCreationFailed,
+                    emittedEventCount: 0);
+            }
+
+            return false;
+        }
+
+        MinecraftWorkspaceSourceReadRequest readRequest = acceptsReadRequest
+            ? requestedReadRequest
+            : MinecraftWorkspaceSourceReadRequest.Live(
+                requestedReadRequest.InitialGeneration,
+                requestedReadRequest.InitialSourceLocalSequence);
 
         try
         {
-            session = _sessionFactory.Create(source);
+            session = acceptsReadRequest
+                ? ((IMinecraftWorkspaceLiveSourceSessionFactoryWithReadRequest)_sessionFactory).Create(source, readRequest)
+                : _sessionFactory.Create(source);
             if (session is null)
             {
                 throw new InvalidOperationException();
             }
 
             created = true;
-            handle = new SourceHandle(source, session);
+            handle = new SourceHandle(source, session, readRequest, immutableSnapshot);
             handle.Handler = (sender, args) => OnSessionEvents(handle, sender, args);
+            handle.HandoffHandler = (sender, args) => OnHandoffCheckpoint(handle, sender, args);
 
             lock (_gate)
             {
@@ -254,25 +488,49 @@ public sealed class MinecraftWorkspaceLiveCoordinator : IDisposable
             }
 
             session.EventsProduced += handle.Handler;
+            if (session is IMinecraftWorkspaceSourceHandoffSession handoffSession)
+            {
+                handoffSession.HandoffCheckpointCaptured += handle.HandoffHandler;
+            }
+
             session.StartMonitoring();
 
-            lock (_gate)
+            if (immutableSnapshot && session is IMinecraftWorkspaceLiveSourceSessionProgress progress &&
+                !progress.IsImmutableComplete)
             {
-                if (_sessions.TryGetValue(source.FileId, out SourceHandle? current) && ReferenceEquals(current, handle))
-                {
-                    _sources[source.FileId] = new MinecraftWorkspaceSourceRuntimeState(
-                        source,
-                        MinecraftWorkspaceSourceStatus.Active,
-                        Reason: null,
-                        EmittedEventCount: handle.EmittedEventCount);
+                throw new InvalidOperationException("Immutable source read did not reach EOF.");
+            }
 
-                    if (source.Family == MinecraftSourceFamily.Yeezus &&
-                        source.SegmentRole == MinecraftSourceSegmentRole.Primary)
+            CaptureProgress(handle);
+            if (immutableSnapshot)
+            {
+                DisposeHandle(handle, removeRuntimeState: false);
+                SetRuntimeState(
+                    source,
+                    MinecraftWorkspaceSourceStatus.ImmutableComplete,
+                    reason: null,
+                    handle.EmittedEventCount,
+                    checkpoint);
+            }
+            else
+            {
+                SetRuntimeState(
+                    source,
+                    MinecraftWorkspaceSourceStatus.Active,
+                    reason: null,
+                    handle.EmittedEventCount,
+                    checkpoint: null);
+                if (source.Family == MinecraftSourceFamily.Yeezus &&
+                    source.SegmentRole == MinecraftSourceSegmentRole.Primary)
+                {
+                    lock (_gate)
                     {
                         _activatedPrimarySourceIds.Add(source.SourceId);
                     }
                 }
             }
+
+            return true;
         }
         catch (Exception)
         {
@@ -285,9 +543,13 @@ public sealed class MinecraftWorkspaceLiveCoordinator : IDisposable
                 TryDispose(session);
             }
 
-            lock (_gate)
+            if (checkpoint is not null)
             {
-                _sources[source.FileId] = new MinecraftWorkspaceSourceRuntimeState(
+                SetHandoffFaulted(source, checkpoint, MinecraftWorkspaceSourceReason.HandoffStartFailed);
+            }
+            else
+            {
+                SetRuntimeState(
                     source,
                     MinecraftWorkspaceSourceStatus.Faulted,
                     created
@@ -295,6 +557,8 @@ public sealed class MinecraftWorkspaceLiveCoordinator : IDisposable
                         : MinecraftWorkspaceSourceReason.SessionCreationFailed,
                     handle?.EmittedEventCount ?? 0);
             }
+
+            return false;
         }
     }
 
@@ -331,22 +595,80 @@ public sealed class MinecraftWorkspaceLiveCoordinator : IDisposable
                 handle.EmittedEventCount = checked(handle.EmittedEventCount + 1);
             }
 
+            CaptureProgress(handle);
             if (_sources.TryGetValue(handle.Source.FileId, out MinecraftWorkspaceSourceRuntimeState? state))
             {
-                _sources[handle.Source.FileId] = state with { EmittedEventCount = handle.EmittedEventCount };
+                _sources[handle.Source.FileId] = state with
+                {
+                    EmittedEventCount = handle.EmittedEventCount,
+                    Generation = handle.CurrentGeneration,
+                    NextSourceLocalSequence = handle.NextSourceLocalSequence
+                };
+            }
+        }
+    }
+
+    private void OnHandoffCheckpoint (
+        SourceHandle handle,
+        object? sender,
+        MinecraftWorkspaceHandoffCheckpointEventArgs args)
+    {
+        if (!ReferenceEquals(sender, handle.Session))
+        {
+            return;
+        }
+
+        lock (_gate)
+        {
+            if (_disposeComplete ||
+                !_sessions.TryGetValue(handle.Source.FileId, out SourceHandle? current) ||
+                !ReferenceEquals(current, handle))
+            {
+                return;
+            }
+
+            var pending = new PendingHandoff(
+                args.Checkpoint,
+                args.PredecessorFileLength,
+                args.SuccessorFileLength,
+                SuccessorFileId: null,
+                IsAmbiguous: false);
+            Dictionary<string, PendingHandoff> target = args.TransitionKind switch
+            {
+                MinecraftHandoffTransitionKind.YeezusPrimaryToRotated => _pendingYeezusHandoffs,
+                MinecraftHandoffTransitionKind.CactusMonitorActivePartToFinal => _pendingCfmHandoffs,
+                _ => throw new ArgumentOutOfRangeException(nameof(args))
+            };
+            StorePendingHandoff(target, handle.Source.SourceId, pending);
+            CaptureProgress(handle);
+            if (_sources.TryGetValue(handle.Source.FileId, out MinecraftWorkspaceSourceRuntimeState? state))
+            {
+                _sources[handle.Source.FileId] = state with
+                {
+                    Generation = handle.CurrentGeneration,
+                    NextSourceLocalSequence = handle.NextSourceLocalSequence
+                };
             }
         }
     }
 
     private void DisposeHandle (SourceHandle handle, bool removeRuntimeState)
     {
+        CaptureProgress(handle);
         TryDispose(handle.Session);
+        CaptureProgress(handle);
 
         try
         {
             if (handle.Handler is not null)
             {
                 handle.Session.EventsProduced -= handle.Handler;
+            }
+
+            if (handle.HandoffHandler is not null &&
+                handle.Session is IMinecraftWorkspaceSourceHandoffSession handoffSession)
+            {
+                handoffSession.HandoffCheckpointCaptured -= handle.HandoffHandler;
             }
         }
         catch (Exception)
@@ -370,15 +692,182 @@ public sealed class MinecraftWorkspaceLiveCoordinator : IDisposable
         }
     }
 
-    private static void TryDispose (IMinecraftWorkspaceLiveSourceSession session)
+    private void CaptureProgress (SourceHandle handle)
+    {
+        if (handle.Session is not IMinecraftWorkspaceLiveSourceSessionProgress progress ||
+            (handle.ImmutableSnapshot && !progress.IsImmutableComplete))
+        {
+            return;
+        }
+
+        handle.CurrentGeneration = progress.CurrentFile.Generation;
+        handle.NextSourceLocalSequence = progress.NextSourceLocalSequence;
+        lock (_gate)
+        {
+            _fileProgress[handle.Source.FileId] = new SourceProgress(
+                handle.CurrentGeneration,
+                handle.NextSourceLocalSequence);
+        }
+    }
+
+    private void SetRuntimeState (
+        DiscoveredSourceFile source,
+        MinecraftWorkspaceSourceStatus status,
+        MinecraftWorkspaceSourceReason? reason,
+        long emittedEventCount,
+        MinecraftSourceHandoffCheckpoint? checkpoint = null)
+    {
+        SourceProgress progress = GetProgress(source.FileId);
+        lock (_gate)
+        {
+            _sources[source.FileId] = new MinecraftWorkspaceSourceRuntimeState(
+                source,
+                status,
+                reason,
+                emittedEventCount,
+                progress.Generation,
+                progress.NextSourceLocalSequence,
+                checkpoint);
+        }
+    }
+
+    private void SetHandoffFaulted (
+        DiscoveredSourceFile source,
+        MinecraftSourceHandoffCheckpoint checkpoint,
+        MinecraftWorkspaceSourceReason reason)
+    {
+        long eventCount;
+        lock (_gate)
+        {
+            eventCount = _sources.TryGetValue(source.FileId, out MinecraftWorkspaceSourceRuntimeState? state)
+                ? state.EmittedEventCount
+                : 0;
+        }
+
+        SourceProgress progress = GetProgress(source.FileId);
+        lock (_gate)
+        {
+            _sources[source.FileId] = new MinecraftWorkspaceSourceRuntimeState(
+                source,
+                MinecraftWorkspaceSourceStatus.HandoffFaulted,
+                reason,
+                eventCount,
+                progress.Generation,
+                progress.NextSourceLocalSequence,
+                checkpoint);
+        }
+    }
+
+    private MinecraftWorkspaceSourceReadRequest CreateDefaultReadRequest (DiscoveredSourceFile source)
+    {
+        SourceProgress next = GetNextProgress(source.FileId);
+        return source.SegmentRole is MinecraftSourceSegmentRole.Rotated or MinecraftSourceSegmentRole.Final
+            ? MinecraftWorkspaceSourceReadRequest.Snapshot(
+                generation: next.Generation,
+                nextSequence: next.NextSourceLocalSequence)
+            : MinecraftWorkspaceSourceReadRequest.Live(next.Generation, next.NextSourceLocalSequence);
+    }
+
+    private MinecraftWorkspaceSourceReadRequest CreateHandoffReadRequest (
+        DiscoveredSourceFile successor,
+        MinecraftSourceHandoffCheckpoint checkpoint)
+    {
+        SourceProgress next = GetNextProgress(successor.FileId);
+        return MinecraftWorkspaceSourceReadRequest.Snapshot(
+            checkpoint.ReplayStartByteOffset,
+            checkpoint.ReplayStartPhysicalLineNumber,
+            next.Generation,
+            checkpoint.NextSourceLocalSequence);
+    }
+
+    private SourceProgress GetNextProgress (string fileId)
+    {
+        lock (_gate)
+        {
+            return _fileProgress.TryGetValue(fileId, out SourceProgress? progress)
+                ? progress with { Generation = checked(progress.Generation + 1) }
+                : new SourceProgress(1, 1);
+        }
+    }
+
+    private SourceProgress GetProgress (string fileId)
+    {
+        lock (_gate)
+        {
+            return _fileProgress.TryGetValue(fileId, out SourceProgress? progress)
+                ? progress
+                : new SourceProgress(1, 1);
+        }
+    }
+
+    private void StorePendingHandoff (
+        Dictionary<string, PendingHandoff> target,
+        string key,
+        PendingHandoff pending)
+    {
+        lock (_gate)
+        {
+            if (target.TryGetValue(key, out PendingHandoff? existing))
+            {
+                if (existing.Checkpoint == pending.Checkpoint)
+                {
+                    target[key] = existing with
+                    {
+                        SuccessorFileId = pending.SuccessorFileId ?? existing.SuccessorFileId
+                    };
+                    return;
+                }
+
+                target[key] = existing with { IsAmbiguous = true };
+                return;
+            }
+
+            target[key] = pending;
+        }
+    }
+
+    private void RemovePending (
+        Dictionary<string, PendingHandoff> target,
+        string key,
+        PendingHandoff expected)
+    {
+        lock (_gate)
+        {
+            if (target.TryGetValue(key, out PendingHandoff? current) && current.Checkpoint == expected.Checkpoint)
+            {
+                target.Remove(key);
+            }
+        }
+    }
+
+    private void RemoveMissingSuccessors (
+        Dictionary<string, PendingHandoff> target,
+        ISet<string> presentFileIds)
+    {
+        foreach (string key in target.Keys.ToArray())
+        {
+            PendingHandoff pending = target[key];
+            if (pending.SuccessorFileId is not null && !presentFileIds.Contains(pending.SuccessorFileId))
+            {
+                target.Remove(key);
+            }
+        }
+    }
+
+    private static long? TryGetLength (string path)
     {
         try
         {
-            session.Dispose();
+            var fileInfo = new FileInfo(path);
+            return fileInfo.Exists ? fileInfo.Length : null;
         }
-        catch (Exception)
+        catch (IOException)
         {
-            // Session teardown remains isolated to its physical source.
+            return null;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return null;
         }
     }
 
@@ -393,8 +882,6 @@ public sealed class MinecraftWorkspaceLiveCoordinator : IDisposable
             return false;
         }
 
-        // Only predecessor history from an earlier reconcile defers a successor. This keeps
-        // historical Rotated/Final files already in the first snapshot valid independent inputs.
         return source.Family switch
         {
             MinecraftSourceFamily.Yeezus =>
@@ -407,22 +894,60 @@ public sealed class MinecraftWorkspaceLiveCoordinator : IDisposable
         };
     }
 
+    private static void TryDispose (IMinecraftWorkspaceLiveSourceSession session)
+    {
+        try
+        {
+            session.Dispose();
+        }
+        catch (Exception)
+        {
+            // Session teardown remains isolated to its physical source.
+        }
+    }
+
     private sealed class SourceHandle
     {
-        public SourceHandle (DiscoveredSourceFile source, IMinecraftWorkspaceLiveSourceSession session)
+        public SourceHandle (
+            DiscoveredSourceFile source,
+            IMinecraftWorkspaceLiveSourceSession session,
+            MinecraftWorkspaceSourceReadRequest readRequest,
+            bool immutableSnapshot)
         {
             Source = source;
             Session = session;
+            ImmutableSnapshot = immutableSnapshot;
+            CurrentGeneration = readRequest.InitialGeneration;
+            NextSourceLocalSequence = readRequest.InitialSourceLocalSequence;
         }
 
         public DiscoveredSourceFile Source { get; }
 
         public IMinecraftWorkspaceLiveSourceSession Session { get; }
 
+        public bool ImmutableSnapshot { get; }
+
         public EventHandler<MinecraftLiveSourceEventsProducedEventArgs>? Handler { get; set; }
 
+        public EventHandler<MinecraftWorkspaceHandoffCheckpointEventArgs>? HandoffHandler { get; set; }
+
         public long EmittedEventCount { get; set; }
+
+        public long CurrentGeneration { get; set; }
+
+        public long NextSourceLocalSequence { get; set; }
     }
+
+    private sealed record SourceProgress (long Generation, long NextSourceLocalSequence);
+
+    private sealed record PendingHandoff (
+        MinecraftSourceHandoffCheckpoint Checkpoint,
+        long PredecessorObservedLength,
+        long? SuccessorLengthAtBoundary,
+        string? SuccessorFileId,
+        bool IsAmbiguous);
+
+    private sealed record PendingHandoffEntry (string Key, PendingHandoff Pending);
 }
 
 #pragma warning restore CA1031
