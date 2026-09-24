@@ -6,6 +6,7 @@ using ColumnizerLib;
 using LogExpert.Core.Classes.Log.Buffers;
 using LogExpert.Core.Classes.Log.ProgressReporters;
 using LogExpert.Core.Classes.Log.Streamreaders;
+using LogExpert.Core.Classes.MinecraftLogs;
 using LogExpert.Core.Classes.xml;
 using LogExpert.Core.Entities;
 using LogExpert.Core.Enums;
@@ -51,6 +52,7 @@ public partial class LogfileReader : ILogfileReader, IMultiFileNavigation, ILogf
     private bool _shouldStop;
     private bool _disposed;
     private ILogFileInfo _watchedILogFileInfo;
+    private IMinecraftPhysicalLineObserver? _minecraftPhysicalLineObserver;
 
     private volatile bool _isFailModeCheckCallPending;
     private volatile bool _isFastFailOnGetLogLine;
@@ -261,6 +263,24 @@ public partial class LogfileReader : ILogfileReader, IMultiFileNavigation, ILogf
     /// Gets or sets a value indicating whether XML mode is enabled.
     /// </summary>
     public bool IsXmlMode { get; set; }
+
+    /// <summary>
+    /// Optional raw physical-line sink for one non-XML, single-file Minecraft source.
+    /// It is fed by the same stream reads that populate the existing LogExpert buffers.
+    /// </summary>
+    public IMinecraftPhysicalLineObserver? MinecraftPhysicalLineObserver
+    {
+        get => _minecraftPhysicalLineObserver;
+        set
+        {
+            if (value is not null)
+            {
+                EnsurePhysicalLineObservationSupported();
+            }
+
+            _minecraftPhysicalLineObserver = value;
+        }
+    }
 
     /// <summary>
     /// Gets or sets the XML log configuration used to control logging behavior and settings.
@@ -1178,6 +1198,11 @@ public partial class LogfileReader : ILogfileReader, IMultiFileNavigation, ILogf
     {
         try
         {
+            if (_minecraftPhysicalLineObserver is not null)
+            {
+                EnsurePhysicalLineObservationSupported();
+            }
+
             using var fileStream = logFileInfo.OpenStream();
             using var reader = GetLogStreamReader(fileStream, EncodingOptions) as ILogStreamReaderMemory;
 
@@ -1243,7 +1268,11 @@ public partial class LogfileReader : ILogfileReader, IMultiFileNavigation, ILogf
                 var droppedLines = logBuffer.PrevBuffersDroppedLinesSum;
                 filePos = reader.Position;
 
-                var (success, lineMemory, wasDropped) = ReadLineMemory(reader, logBuffer.StartLine + logBuffer.LineCount, logBuffer.StartLine + logBuffer.LineCount + droppedLines);
+                var (success, lineMemory, wasDropped) = ReadLineMemory(
+                    reader,
+                    logBuffer.StartLine + logBuffer.LineCount,
+                    logBuffer.StartLine + logBuffer.LineCount + droppedLines,
+                    observePhysicalLine: _minecraftPhysicalLineObserver is not null);
 
                 while (success)
                 {
@@ -1256,7 +1285,11 @@ public partial class LogfileReader : ILogfileReader, IMultiFileNavigation, ILogf
                     {
                         logBuffer.DroppedLinesCount += 1;
                         droppedLines++;
-                        (success, lineMemory, wasDropped) = ReadLineMemory(reader, logBuffer.StartLine + logBuffer.LineCount, logBuffer.StartLine + logBuffer.LineCount + droppedLines);
+                        (success, lineMemory, wasDropped) = ReadLineMemory(
+                            reader,
+                            logBuffer.StartLine + logBuffer.LineCount,
+                            logBuffer.StartLine + logBuffer.LineCount + droppedLines,
+                            observePhysicalLine: _minecraftPhysicalLineObserver is not null);
                         continue;
                     }
 
@@ -1304,7 +1337,11 @@ public partial class LogfileReader : ILogfileReader, IMultiFileNavigation, ILogf
                         }
                     }
 
-                    (success, lineMemory, wasDropped) = ReadLineMemory(reader, logBuffer.StartLine + logBuffer.LineCount, logBuffer.StartLine + logBuffer.LineCount + droppedLines);
+                    (success, lineMemory, wasDropped) = ReadLineMemory(
+                        reader,
+                        logBuffer.StartLine + logBuffer.LineCount,
+                        logBuffer.StartLine + logBuffer.LineCount + droppedLines,
+                        observePhysicalLine: _minecraftPhysicalLineObserver is not null);
                 }
 
                 logBuffer.Size = filePos - logBuffer.StartPos;
@@ -1555,6 +1592,7 @@ public partial class LogfileReader : ILogfileReader, IMultiFileNavigation, ILogf
         if (!_isDeleted)
         {
             _logger.Debug(CultureInfo.InvariantCulture, "File not FileNotFoundException catched. Switching to 'deleted' mode.");
+            _minecraftPhysicalLineObserver?.OnSourceDeleted();
             _isDeleted = true;
             oldSize = _fileLength = -1;
             FileSize = 0;
@@ -1580,6 +1618,7 @@ public partial class LogfileReader : ILogfileReader, IMultiFileNavigation, ILogf
     {
         if (_isDeleted)
         {
+            _minecraftPhysicalLineObserver?.OnSourceRecreated();
             OnRespawned();
             // prevent size update events. The window should reload the complete file.
             FileSize = _fileLength;
@@ -1612,6 +1651,11 @@ public partial class LogfileReader : ILogfileReader, IMultiFileNavigation, ILogf
         };
 
         var newSize = _fileLength;
+        if (newSize < FileSize && !_isDeleted)
+        {
+            _minecraftPhysicalLineObserver?.OnSourceTruncated();
+        }
+
         if (newSize < FileSize || _isDeleted)
         {
             _logger.Info(CultureInfo.InvariantCulture, "File was created anew: new size={0}, oldSize={1}", newSize, FileSize);
@@ -1637,6 +1681,13 @@ public partial class LogfileReader : ILogfileReader, IMultiFileNavigation, ILogf
                 {
                     // Trigger "new file" handling (reload)
                     _progressReporter.ReportNewFile(_fileName, 0, _fileLength);
+
+                    // The optional Minecraft bridge still consumes the replacement through
+                    // this LogfileReader path; it does not open a second tail stream.
+                    if (_minecraftPhysicalLineObserver is not null)
+                    {
+                        ReadFiles(notifyChanges: false);
+                    }
 
                     if (_isDeleted)
                     {
@@ -1792,7 +1843,11 @@ public partial class LogfileReader : ILogfileReader, IMultiFileNavigation, ILogf
     /// the line as a string. If the reader supports memory-based access, the memory buffer is populated; otherwise, it
     /// is null.
     /// </returns>
-    private (bool Success, ReadOnlyMemory<char> LineMemory, bool wasDropped) ReadLineMemory (ILogStreamReaderMemory reader, int lineNum, int realLineNum)
+    private (bool Success, ReadOnlyMemory<char> LineMemory, bool wasDropped) ReadLineMemory (
+        ILogStreamReaderMemory reader,
+        int lineNum,
+        int realLineNum,
+        bool observePhysicalLine = false)
     {
         if (reader is null)
         {
@@ -1805,7 +1860,23 @@ public partial class LogfileReader : ILogfileReader, IMultiFileNavigation, ILogf
             return (false, ReadOnlyMemory<char>.Empty, false);
         }
 
-        if (!reader.TryReadLine(out var lineMemory))
+        ReadOnlyMemory<char> lineMemory;
+        if (observePhysicalLine && _minecraftPhysicalLineObserver is not null)
+        {
+            if (reader is not ILogStreamReaderPhysicalLineMetadata metadataReader)
+            {
+                throw new NotSupportedException();
+            }
+
+            if (!metadataReader.TryReadLineWithMetadata(out lineMemory, out var fullContentMemory, out var metadata))
+            {
+                return (false, ReadOnlyMemory<char>.Empty, false);
+            }
+
+            _minecraftPhysicalLineObserver.OnPhysicalLine(
+                new MinecraftPhysicalLineRead(fullContentMemory.ToString(), metadata));
+        }
+        else if (!reader.TryReadLine(out lineMemory))
         {
             return (false, ReadOnlyMemory<char>.Empty, false);
         }
@@ -1824,6 +1895,14 @@ public partial class LogfileReader : ILogfileReader, IMultiFileNavigation, ILogf
         }
 
         return (true, lineMemory, false);
+    }
+
+    private void EnsurePhysicalLineObservationSupported ()
+    {
+        if (_readerType != ReaderType.SystemDirect || IsXmlMode || IsMultiFile)
+        {
+            throw new NotSupportedException();
+        }
     }
 
 #if DEBUG

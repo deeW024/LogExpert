@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.Text;
 
+using LogExpert.Core.Classes.MinecraftLogs;
 using LogExpert.Core.Entities;
 using LogExpert.Core.Interfaces;
 
@@ -11,13 +12,12 @@ namespace LogExpert.Core.Classes.Log.Streamreaders;
 /// scans for newline boundaries, and returns ReadOnlyMemory&lt;char&gt; slices without
 /// allocating per-line strings. Eliminates the StreamReader.ReadLine() string allocation.
 /// </summary>
-public class PositionAwareStreamReaderDirect : PositionAwareStreamReaderBase, ILogStreamReaderMemory
+public class PositionAwareStreamReaderDirect : PositionAwareStreamReaderBase, ILogStreamReaderPhysicalLineMetadata
 {
     #region Constants
 
     private const int BLOCK_SIZE = 32_768; // 64 KB (32K chars × 2 bytes), under LOH threshold
     private const char CHAR_LF = '\n';
-    private const char CHAR_CR = '\r';
 
     private static readonly SearchValues<char> _lineTerminators = SearchValues.Create("\r\n");
 
@@ -30,7 +30,6 @@ public class PositionAwareStreamReaderDirect : PositionAwareStreamReaderBase, IL
     private int _scanOffset;       // current scan position in _readBlock
     private bool _eof;
     private bool _initialized;     // first block filled from the current stream position
-    private int _terminatorCharByteSize; // bytes for a single '\r' or '\n' in the active encoding
     private readonly List<char[]> _completedBlocks = [];
 
     public override bool IsDisposed { get; protected set; }
@@ -66,6 +65,23 @@ public class PositionAwareStreamReaderDirect : PositionAwareStreamReaderBase, IL
     /// files with mixed line endings.
     /// </summary>
     public bool TryReadLine (out ReadOnlyMemory<char> lineMemory)
+    {
+        return TryReadLineCore(out lineMemory, out _, out _, includeMetadata: false);
+    }
+
+    public bool TryReadLineWithMetadata (
+        out ReadOnlyMemory<char> displayLineMemory,
+        out ReadOnlyMemory<char> fullContentMemory,
+        out PhysicalLineReadMetadata metadata)
+    {
+        return TryReadLineCore(out displayLineMemory, out fullContentMemory, out metadata, includeMetadata: true);
+    }
+
+    private bool TryReadLineCore (
+        out ReadOnlyMemory<char> lineMemory,
+        out ReadOnlyMemory<char> fullContentMemory,
+        out PhysicalLineReadMetadata metadata,
+        bool includeMetadata)
     {
         var reader = GetStreamReader();
 
@@ -109,13 +125,34 @@ public class PositionAwareStreamReaderDirect : PositionAwareStreamReaderBase, IL
 
                     var lineLength = hitIndex;
 
-                    // Enforce MaximumLineLength on the returned slice, but count the full
-                    // content for the byte position.
+                    var startByteOffset = Position;
+                    var contentSpan = _readBlock.AsSpan(_scanOffset, lineLength);
+                    var contentByteLength = Encoding.GetByteCount(contentSpan);
+                    var terminatorSpan = _readBlock.AsSpan(_scanOffset + lineLength, terminatorChars);
+                    var terminatorByteLength = Encoding.GetByteCount(terminatorSpan);
+
+                    // Enforce MaximumLineLength on the display slice, while keeping the
+                    // complete source line available to an opt-in physical-line observer.
                     var cappedLength = Math.Min(lineLength, MaximumLineLength);
                     lineMemory = _readBlock.AsMemory(_scanOffset, cappedLength);
+                    fullContentMemory = includeMetadata
+                        ? _readBlock.AsMemory(_scanOffset, lineLength)
+                        : default;
 
-                    var contentSpan = _readBlock.AsSpan(_scanOffset, lineLength);
-                    MovePosition(Encoding.GetByteCount(contentSpan) + (terminatorChars * _terminatorCharByteSize));
+                    var terminator = terminatorChars == 2
+                        ? PhysicalLineTerminator.CrLf
+                        : searchSpan[hitIndex] == CHAR_LF
+                            ? PhysicalLineTerminator.Lf
+                            : PhysicalLineTerminator.Cr;
+                    metadata = includeMetadata
+                        ? new PhysicalLineReadMetadata(
+                            startByteOffset,
+                            checked(startByteOffset + contentByteLength),
+                            terminator,
+                            terminatorByteLength)
+                        : default;
+
+                    MovePosition(contentByteLength + terminatorByteLength);
 
                     // Advance scan past the content and its terminator.
                     _scanOffset += hitIndex + terminatorChars;
@@ -135,13 +172,28 @@ public class PositionAwareStreamReaderDirect : PositionAwareStreamReaderBase, IL
                     lineMemory = _readBlock.AsMemory(_scanOffset, cappedLength);
 
                     var fullSpan = _readBlock.AsSpan(_scanOffset, remaining);
-                    MovePosition(Encoding.GetByteCount(fullSpan));
+                    var startByteOffset = Position;
+                    var contentByteLength = Encoding.GetByteCount(fullSpan);
+                    fullContentMemory = includeMetadata
+                        ? _readBlock.AsMemory(_scanOffset, remaining)
+                        : default;
+                    metadata = includeMetadata
+                        ? new PhysicalLineReadMetadata(
+                            startByteOffset,
+                            checked(startByteOffset + contentByteLength),
+                            PhysicalLineTerminator.None,
+                            0)
+                        : default;
+
+                    MovePosition(contentByteLength);
 
                     _scanOffset = _readBlockLength;
                     return true;
                 }
 
                 lineMemory = default;
+                fullContentMemory = default;
+                metadata = default;
                 return false;
             }
 
@@ -254,11 +306,6 @@ public class PositionAwareStreamReaderDirect : PositionAwareStreamReaderBase, IL
         }
 
         _initialized = true;
-
-        // A single '\r' and a single '\n' encode to the same number of bytes in every encoding
-        // LogExpert uses (ASCII control chars), so one value covers \n, \r and (×2) \r\n.
-        Span<char> singleTerminator = [CHAR_LF];
-        _terminatorCharByteSize = Encoding.GetByteCount(singleTerminator);
 
         var charsRead = reader.Read(_readBlock, 0, BLOCK_SIZE);
         _readBlockLength = charsRead;
