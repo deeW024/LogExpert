@@ -437,9 +437,6 @@ public sealed class MinecraftWorkspaceLiveCoordinator : IDisposable
         MinecraftWorkspaceSourceReadRequest requestedReadRequest,
         MinecraftSourceHandoffCheckpoint? checkpoint)
     {
-        IMinecraftWorkspaceLiveSourceSession? session = null;
-        SourceHandle? handle = null;
-        bool created = false;
         bool acceptsReadRequest = _sessionFactory is IMinecraftWorkspaceLiveSourceSessionFactoryWithReadRequest;
         bool immutableSnapshot = requestedReadRequest.ImmutableSnapshot && acceptsReadRequest;
 
@@ -467,6 +464,7 @@ public sealed class MinecraftWorkspaceLiveCoordinator : IDisposable
                 requestedReadRequest.InitialGeneration,
                 requestedReadRequest.InitialSourceLocalSequence);
 
+        IMinecraftWorkspaceLiveSourceSession session;
         try
         {
             session = acceptsReadRequest
@@ -476,12 +474,31 @@ public sealed class MinecraftWorkspaceLiveCoordinator : IDisposable
             {
                 throw new InvalidOperationException();
             }
+        }
+        catch (Exception)
+        {
+            if (checkpoint is not null)
+            {
+                SetHandoffFaulted(source, checkpoint, MinecraftWorkspaceSourceReason.HandoffStartFailed);
+            }
+            else
+            {
+                SetRuntimeState(
+                    source,
+                    MinecraftWorkspaceSourceStatus.Faulted,
+                    MinecraftWorkspaceSourceReason.SessionCreationFailed,
+                    emittedEventCount: 0);
+            }
 
-            created = true;
-            handle = new SourceHandle(source, session, readRequest, immutableSnapshot);
-            handle.Handler = (sender, args) => OnSessionEvents(handle, sender, args);
-            handle.HandoffHandler = (sender, args) => OnHandoffCheckpoint(handle, sender, args);
+            return false;
+        }
 
+        var handle = new SourceHandle(source, session, readRequest, immutableSnapshot);
+        handle.Handler = (sender, args) => OnSessionEvents(handle, sender, args);
+        handle.HandoffHandler = (sender, args) => OnHandoffCheckpoint(handle, sender, args);
+
+        try
+        {
             lock (_gate)
             {
                 _sessions.Add(source.FileId, handle);
@@ -498,7 +515,7 @@ public sealed class MinecraftWorkspaceLiveCoordinator : IDisposable
             if (immutableSnapshot && session is IMinecraftWorkspaceLiveSourceSessionProgress progress &&
                 !progress.IsImmutableComplete)
             {
-                throw new InvalidOperationException("Immutable source read did not reach EOF.");
+                throw new InvalidOperationException();
             }
 
             CaptureProgress(handle);
@@ -534,14 +551,7 @@ public sealed class MinecraftWorkspaceLiveCoordinator : IDisposable
         }
         catch (Exception)
         {
-            if (handle is not null)
-            {
-                DisposeHandle(handle, removeRuntimeState: false);
-            }
-            else if (session is not null)
-            {
-                TryDispose(session);
-            }
+            DisposeHandle(handle, removeRuntimeState: false);
 
             if (checkpoint is not null)
             {
@@ -552,10 +562,8 @@ public sealed class MinecraftWorkspaceLiveCoordinator : IDisposable
                 SetRuntimeState(
                     source,
                     MinecraftWorkspaceSourceStatus.Faulted,
-                    created
-                        ? MinecraftWorkspaceSourceReason.SessionStartFailed
-                        : MinecraftWorkspaceSourceReason.SessionCreationFailed,
-                    handle?.EmittedEventCount ?? 0);
+                    MinecraftWorkspaceSourceReason.SessionStartFailed,
+                    handle.EmittedEventCount);
             }
 
             return false;
@@ -840,7 +848,7 @@ public sealed class MinecraftWorkspaceLiveCoordinator : IDisposable
         }
     }
 
-    private void RemoveMissingSuccessors (
+    private static void RemoveMissingSuccessors (
         Dictionary<string, PendingHandoff> target,
         ISet<string> presentFileIds)
     {

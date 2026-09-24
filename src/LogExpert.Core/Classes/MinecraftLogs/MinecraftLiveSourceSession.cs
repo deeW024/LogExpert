@@ -500,7 +500,7 @@ public sealed class MinecraftLiveSourceSession :
             var fileInfo = new FileInfo(_source.FullPath);
             if (!fileInfo.Exists || fileInfo.Length < _readRequest.StartByteOffset)
             {
-                throw new IOException("The immutable successor is shorter than its replay start.");
+                throw new IOException();
             }
 
             long initialLength = fileInfo.Length;
@@ -508,14 +508,14 @@ public sealed class MinecraftLiveSourceSession :
             fileInfo.Refresh();
             if (!fileInfo.Exists || fileInfo.Length != initialLength || _reader.IsFileUnavailable)
             {
-                throw new IOException("The immutable successor changed or became unavailable during the read.");
+                throw new IOException();
             }
 
             lock (_gate)
             {
                 if (_nextExpectedByteOffset > fileInfo.Length)
                 {
-                    throw new IOException("The immutable successor did not honor its replay start.");
+                    throw new IOException();
                 }
 
                 IReadOnlyList<LogParserInput> finalInputs = _framer.FinalizeGeneration();
