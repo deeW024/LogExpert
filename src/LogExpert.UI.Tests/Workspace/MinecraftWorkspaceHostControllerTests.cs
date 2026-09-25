@@ -311,6 +311,52 @@ public sealed class MinecraftWorkspaceHostControllerTests
     }
 
     [Test]
+    public void Real_periodic_trigger_refreshes_and_updates_backlog_while_paused ()
+    {
+        List<MinecraftWorkspaceIngressEvent> events = [
+            CreateHostIngress("pause-timer-file", 1, "match initial"),
+            CreateHostIngress("pause-timer-file", 2, "skip initial")];
+        object eventsGate = new();
+        FakeRuntime runtime = new("pause-timer", _ => Snapshot("pause-timer"))
+        {
+            QuerySnapshotFactory = (call, query) =>
+            {
+                lock (eventsGate)
+                {
+                    return Snapshot($"pause-timer-{call}", events.ToArray(), query);
+                }
+            }
+        };
+        _host = CreateHost(
+            new FakeRuntimeFactory { CreateRuntime = _ => runtime },
+            new FakePicker(null),
+            static () => new WinFormsMinecraftWorkspaceRefreshTrigger());
+        OpenAndDrainInitialRefresh(_host, "pause-timer-root");
+        MinecraftWorkspaceReadOnlyControl control = _host.Controller.ActiveDocument!.WorkspaceControl;
+        control.SearchTextBox.Text = "match";
+        PumpUntil(_host, () => control.Snapshot.QuerySnapshot.SearchText == "match");
+        control.PauseButton.PerformClick();
+        MinecraftWorkspaceReadOnlyViewSnapshot visibleSnapshot = control.Snapshot;
+        int refreshesBeforeAppend = runtime.RefreshCount;
+
+        lock (eventsGate)
+        {
+            events.Add(CreateHostIngress("pause-timer-file", 3, "match appended"));
+            events.Add(CreateHostIngress("pause-timer-file", 4, "skip appended"));
+        }
+
+        PumpUntil(_host, () => control.BacklogCount == 1);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(runtime.RefreshCount, Is.GreaterThan(refreshesBeforeAppend), "The periodic trigger continues refreshing while paused.");
+            Assert.That(control.IsPaused, Is.True);
+            Assert.That(control.Snapshot, Is.SameAs(visibleSnapshot), "The visible snapshot remains frozen.");
+            Assert.That(control.BacklogCount, Is.EqualTo(1), "Only the unseen matching identity contributes to backlog.");
+        });
+    }
+
+    [Test]
     public void Paused_query_revision_applies_once_discards_stale_results_and_keeps_only_latest_query ()
     {
         List<MinecraftWorkspaceIngressEvent> events = [
@@ -953,7 +999,8 @@ public sealed class MinecraftWorkspaceHostControllerTests
 
     private TestHost CreateHost (
         IMinecraftWorkspaceHostRuntimeFactory runtimeFactory,
-        FakePicker picker)
+        FakePicker picker,
+        Func<IMinecraftWorkspaceRefreshTrigger>? refreshTriggerFactory = null)
     {
         Form form = new()
         {
@@ -971,6 +1018,7 @@ public sealed class MinecraftWorkspaceHostControllerTests
         form.Show();
         Application.DoEvents();
         ManualRefreshTriggerFactory triggerFactory = new();
+        refreshTriggerFactory ??= triggerFactory.Create;
         QueuedHostDispatcher dispatcher = new();
         List<Exception> errors = [];
         MinecraftWorkspaceHostController controller = new(
@@ -978,7 +1026,7 @@ public sealed class MinecraftWorkspaceHostControllerTests
             dockPanel,
             picker,
             runtimeFactory,
-            triggerFactory.Create,
+            refreshTriggerFactory,
             dispatcher,
             errors.Add);
         return _host = new TestHost(form, dockPanel, controller, dispatcher, triggerFactory, errors);

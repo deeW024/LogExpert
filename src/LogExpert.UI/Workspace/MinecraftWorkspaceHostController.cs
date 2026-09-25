@@ -69,26 +69,25 @@ internal sealed class FolderBrowserMinecraftWorkspacePicker : IMinecraftWorkspac
 internal sealed class WinFormsMinecraftWorkspaceRefreshTrigger : IMinecraftWorkspaceRefreshTrigger
 {
     /// <summary>Triggers a coalesced workspace refresh every second.</summary>
-    private readonly System.Windows.Forms.Timer _timer = new() { Interval = 1000 };
+    private readonly System.Threading.Timer _timer;
 
     public WinFormsMinecraftWorkspaceRefreshTrigger ()
     {
-        _timer.Tick += OnTimerTick;
+        _timer = new System.Threading.Timer(OnTimerTick, null, Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
     }
 
     public event EventHandler? Tick;
 
-    public void Start () => _timer.Start();
+    public void Start () => _ = _timer.Change(TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
 
-    public void StopTrigger () => _timer.Stop();
+    public void StopTrigger () => _ = _timer.Change(Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
 
     public void Dispose ()
     {
-        _timer.Tick -= OnTimerTick;
         _timer.Dispose();
     }
 
-    private void OnTimerTick (object? sender, EventArgs e) => Tick?.Invoke(this, e);
+    private void OnTimerTick (object? state) => Tick?.Invoke(this, EventArgs.Empty);
 }
 
 [SupportedOSPlatform("windows")]
