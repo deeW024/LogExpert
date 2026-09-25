@@ -34,7 +34,7 @@ internal interface IMinecraftWorkspaceRefreshTrigger : IDisposable
 [SupportedOSPlatform("windows")]
 internal interface IMinecraftWorkspaceHostRuntime : IDisposable
 {
-    MinecraftWorkspaceReadOnlyViewSnapshot Refresh ();
+    MinecraftWorkspaceReadOnlyViewSnapshot Refresh (MinecraftWorkspaceTimelineFilterQuery query);
 }
 
 [SupportedOSPlatform("windows")]
@@ -155,7 +155,6 @@ internal sealed class MinecraftWorkspaceHostRuntime : IMinecraftWorkspaceHostRun
 {
     private readonly MinecraftWorkspaceTimeline _timeline;
     private readonly MinecraftWorkspaceTimelineFilter _filter = new();
-    private readonly MinecraftWorkspaceTimelineFilterQuery _query = new();
     private int _disposed;
 
     public MinecraftWorkspaceHostRuntime (
@@ -186,8 +185,9 @@ internal sealed class MinecraftWorkspaceHostRuntime : IMinecraftWorkspaceHostRun
 
     public string DisplayName { get; }
 
-    public MinecraftWorkspaceReadOnlyViewSnapshot Refresh ()
+    public MinecraftWorkspaceReadOnlyViewSnapshot Refresh (MinecraftWorkspaceTimelineFilterQuery query)
     {
+        ArgumentNullException.ThrowIfNull(query);
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
         Coordinator.Reconcile();
         IReadOnlyList<MinecraftWorkspaceIngressEvent> events = Coordinator.DrainPendingEvents();
@@ -198,7 +198,7 @@ internal sealed class MinecraftWorkspaceHostRuntime : IMinecraftWorkspaceHostRun
 
         MinecraftWorkspaceTimelineFilterResult result = _filter.Evaluate(
             _timeline.GetOrderedSnapshot(),
-            _query);
+            query);
         return MinecraftWorkspaceReadOnlyViewPresenter.CreateSnapshot(DisplayName, result);
     }
 
@@ -326,7 +326,7 @@ internal sealed class MinecraftWorkspaceHostController : IDisposable
         try
         {
             runtime = _runtimeFactory.Create(rootPath);
-            snapshot = runtime.Refresh();
+            snapshot = runtime.Refresh(new MinecraftWorkspaceTimelineFilterQuery());
         }
         catch (Exception exception)
         {
@@ -456,6 +456,8 @@ internal sealed class MinecraftWorkspaceHostSession : IDisposable
     private readonly object _gate = new();
     private bool _refreshRunning;
     private bool _refreshPending;
+    private MinecraftWorkspaceTimelineFilterQuery _currentQuery;
+    private long _queryRevision;
     private int _disposed;
 
     public MinecraftWorkspaceHostSession (
@@ -472,7 +474,9 @@ internal sealed class MinecraftWorkspaceHostSession : IDisposable
         _dispatcher = dispatcher;
         _isCurrent = isCurrent;
         _documentClosed = documentClosed;
+        _currentQuery = Document.WorkspaceControl.Snapshot.QuerySnapshot;
         Document.FormClosed += OnDocumentFormClosed;
+        Document.WorkspaceControl.FilterQueryChanged += OnFilterQueryChanged;
     }
 
     public MinecraftWorkspaceReadOnlyDocument Document { get; }
@@ -506,6 +510,7 @@ internal sealed class MinecraftWorkspaceHostSession : IDisposable
         _trigger.Tick -= OnTriggerTick;
         _trigger.StopTrigger();
         _trigger.Dispose();
+        Document.WorkspaceControl.FilterQueryChanged -= OnFilterQueryChanged;
         Document.FormClosed -= OnDocumentFormClosed;
         try
         {
@@ -524,6 +529,22 @@ internal sealed class MinecraftWorkspaceHostSession : IDisposable
     }
 
     private void OnTriggerTick (object? sender, EventArgs e) => RequestRefresh();
+
+    private void OnFilterQueryChanged (object? sender, MinecraftWorkspaceFilterQueryChangedEventArgs e)
+    {
+        lock (_gate)
+        {
+            if (Volatile.Read(ref _disposed) != 0)
+            {
+                return;
+            }
+
+            _currentQuery = e.Query;
+            _queryRevision = checked(_queryRevision + 1);
+        }
+
+        RequestRefresh();
+    }
 
     private void RequestRefresh ()
     {
@@ -565,12 +586,28 @@ internal sealed class MinecraftWorkspaceHostSession : IDisposable
 
     private void RunRefresh ()
     {
+        MinecraftWorkspaceTimelineFilterQuery query;
+        long queryRevision;
+        lock (_gate)
+        {
+            if (Volatile.Read(ref _disposed) != 0)
+            {
+                _refreshRunning = false;
+                _refreshPending = false;
+                return;
+            }
+
+            query = _currentQuery;
+            queryRevision = _queryRevision;
+            _refreshPending = false;
+        }
+
         MinecraftWorkspaceReadOnlyViewSnapshot? snapshot = null;
         if (Volatile.Read(ref _disposed) == 0)
         {
             try
             {
-                snapshot = _runtime.Refresh();
+                snapshot = _runtime.Refresh(query);
             }
             catch (Exception exception)
             {
@@ -580,7 +617,7 @@ internal sealed class MinecraftWorkspaceHostSession : IDisposable
 
         if (snapshot != null && Volatile.Read(ref _disposed) == 0)
         {
-            _ = _dispatcher.TryPostToUi(() => ApplySnapshotIfCurrent(snapshot));
+            _ = _dispatcher.TryPostToUi(() => ApplySnapshotIfCurrent(snapshot, queryRevision));
         }
 
         bool runCoalescedRefresh;
@@ -607,10 +644,17 @@ internal sealed class MinecraftWorkspaceHostSession : IDisposable
         }
     }
 
-    private void ApplySnapshotIfCurrent (MinecraftWorkspaceReadOnlyViewSnapshot snapshot)
+    private void ApplySnapshotIfCurrent (MinecraftWorkspaceReadOnlyViewSnapshot snapshot, long queryRevision)
     {
-        if (Volatile.Read(ref _disposed) != 0 || !_isCurrent(this) ||
-            Document.IsDisposed || Document.WorkspaceControl.IsDisposed)
+        lock (_gate)
+        {
+            if (Volatile.Read(ref _disposed) != 0 || queryRevision != _queryRevision)
+            {
+                return;
+            }
+        }
+
+        if (!_isCurrent(this) || Document.IsDisposed || Document.WorkspaceControl.IsDisposed)
         {
             return;
         }

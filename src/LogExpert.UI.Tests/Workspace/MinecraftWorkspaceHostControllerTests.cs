@@ -174,6 +174,114 @@ public sealed class MinecraftWorkspaceHostControllerTests
     }
 
     [Test]
+    public void Newer_query_revision_discards_a_stale_snapshot_before_UI_application ()
+    {
+        MinecraftWorkspaceIngressEvent match = CreateHostIngress("query-file", 1, "newer query match");
+        MinecraftWorkspaceTimeline timeline = new("host-query-workspace");
+        timeline.AppendBatch([match]);
+        MinecraftWorkspaceTimelineFilter filter = new();
+        FakeRuntime runtime = new("query-workspace", _ => Snapshot("query-workspace"))
+        {
+            QuerySnapshotFactory = (_, query) => MinecraftWorkspaceReadOnlyViewPresenter.CreateSnapshot(
+                query.SearchText ?? "empty-query",
+                filter.Evaluate(timeline.GetOrderedSnapshot(), query))
+        };
+        FakeRuntimeFactory runtimeFactory = new() { CreateRuntime = _ => runtime };
+        _host = CreateHost(runtimeFactory, new FakePicker(null));
+        OpenWorkspace(_host, "query-root");
+        MinecraftWorkspaceReadOnlyControl control = _host.Controller.ActiveDocument!.WorkspaceControl;
+        using ManualResetEventSlim staleRefreshStarted = new();
+        using ManualResetEventSlim releaseStaleRefresh = new();
+        runtime.OnRefresh = call =>
+        {
+            if (call == 2)
+            {
+                staleRefreshStarted.Set();
+                Assert.That(releaseStaleRefresh.Wait(TimeSpan.FromSeconds(10)), Is.True);
+            }
+        };
+
+        Task staleRefresh = Task.Run(_host.Dispatcher.RunNextBackground);
+        Assert.That(staleRefreshStarted.Wait(TimeSpan.FromSeconds(10)), Is.True);
+        control.SearchTextBox.Text = "older";
+        control.SearchTextBox.Text = "newer";
+        releaseStaleRefresh.Set();
+        Assert.That(staleRefresh.Wait(TimeSpan.FromSeconds(10)), Is.True);
+
+        _host.Dispatcher.RunNextUi();
+        Assert.Multiple(() =>
+        {
+            Assert.That(control.Snapshot.QuerySnapshot.SearchText, Is.Null, "The queued old revision must not replace the applied snapshot.");
+            Assert.That(control.SearchTextBox.Text, Is.EqualTo("newer"));
+            Assert.That(_host.Dispatcher.PendingBackground, Is.EqualTo(1));
+        });
+
+        _host.Dispatcher.RunNextBackground();
+        _host.Dispatcher.RunNextUi();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(runtime.RefreshQueries, Has.Count.EqualTo(3));
+            Assert.That(runtime.RefreshQueries[1].SearchText, Is.Null);
+            Assert.That(runtime.RefreshQueries[2].SearchText, Is.EqualTo("newer"));
+            Assert.That(control.Snapshot.QuerySnapshot.SearchText, Is.EqualTo("newer"));
+            Assert.That(control.Snapshot.Rows.Select(row => row.Identity), Is.EqualTo(new[] { match.IngressSequence }));
+        });
+
+        _host.TriggerFactory.Triggers.Single().Raise();
+        _host.Dispatcher.RunNextBackground();
+        _host.Dispatcher.RunNextUi();
+        Assert.That(runtime.RefreshQueries[^1], Is.SameAs(control.Snapshot.QuerySnapshot),
+            "Periodic refresh must evaluate the currently applied query snapshot.");
+    }
+
+    [Test]
+    public void Invalid_regex_and_timeout_states_reach_the_workspace_without_UI_exceptions ()
+    {
+        string timeoutText = new string('a', 50_000) + "!";
+        MinecraftWorkspaceTimeline timeline = new("host-query-workspace");
+        timeline.AppendBatch([
+            CreateHostIngress("regex-normal", 1, "normal event"),
+            CreateHostIngress("regex-timeout", 2, timeoutText)]);
+        MinecraftWorkspaceTimelineFilter filter = new();
+        FakeRuntime runtime = new("regex-status", _ => Snapshot("regex-status"))
+        {
+            QuerySnapshotFactory = (_, query) => MinecraftWorkspaceReadOnlyViewPresenter.CreateSnapshot(
+                "regex-status",
+                filter.Evaluate(timeline.GetOrderedSnapshot(), query))
+        };
+        _host = CreateHost(new FakeRuntimeFactory { CreateRuntime = _ => runtime }, new FakePicker(null));
+        OpenAndDrainInitialRefresh(_host, "regex-status-root");
+        MinecraftWorkspaceReadOnlyControl control = _host.Controller.ActiveDocument!.WorkspaceControl;
+
+        control.SearchTextBox.Text = "[";
+        control.RegexCheckBox.Checked = true;
+        _host.Dispatcher.RunNextBackground();
+        _host.Dispatcher.DrainUi();
+        Assert.Multiple(() =>
+        {
+            Assert.That(control.Snapshot.FilterStatus, Is.EqualTo(MinecraftWorkspaceFilterStatus.InvalidRegex));
+            Assert.That(control.StatusLabel.Text, Does.Contain("InvalidRegex"));
+            Assert.That(control.StatusLabel.Text, Does.Contain("Matched: incomplete"));
+            Assert.That(control.Snapshot.Rows, Is.Empty);
+            Assert.That(_host.Errors, Is.Empty);
+        });
+
+        control.SearchTextBox.Text = "^(a+)+$";
+        _host.Dispatcher.RunNextBackground();
+        _host.Dispatcher.DrainUi();
+        Assert.Multiple(() =>
+        {
+            Assert.That(control.Snapshot.FilterStatus, Is.EqualTo(MinecraftWorkspaceFilterStatus.RegexTimedOut));
+            Assert.That(control.StatusLabel.Text, Does.Contain("RegexTimedOut"));
+            Assert.That(control.StatusLabel.Text, Does.Contain("Matched: incomplete"));
+            Assert.That(control.Snapshot.MatchedCount, Is.Null);
+            Assert.That(control.Snapshot.Rows, Is.Empty);
+            Assert.That(_host.Errors, Is.Empty);
+        });
+    }
+
+    [Test]
     public void Failed_refresh_keeps_last_successful_snapshot ()
     {
         FakeRuntimeFactory runtimeFactory = new();
@@ -429,6 +537,126 @@ public sealed class MinecraftWorkspaceHostControllerTests
         Assert.Throws<ObjectDisposedException>(() => runtimeFactory.LastRuntime!.Coordinator.Reconcile());
     }
 
+    [Test]
+    public void Real_pipeline_applies_the_exact_UI_query_to_YEE50_and_keeps_matching_late_rows_selected ()
+    {
+        string latestPath = CreateFile("logs/latest.log", "[18:41:03] [Render thread/ERROR] synthetic latest initial\n");
+        _ = CreateFile("logs/yeezus.log",
+            "2099-01-01T10:02:00Z [INFO] [yeezus-core] [Client thread] synthetic yeezus initial\n" +
+            "2099-01-01T10:04:00Z [INFO] [yeezus-core] [Client thread] synthetic timeline watermark\n");
+        string initialCfmPath = CreateFile(
+            "cactusmonitor/sessions/cfm-initial.jsonl.part",
+            $"{{\"type\":\"CYCLE\",\"sessionId\":\"synthetic-initial\",\"sequence\":1,\"timestampEpochMillis\":{Utc("2099-01-01T10:03:00Z").ToUnixTimeMilliseconds()}}}\n");
+        TrackingWorkspaceRuntimeFactory runtimeFactory = new(
+            new MinecraftWorkspaceHostRuntimeFactory(PluginRegistry.PluginRegistry.Instance, 2048));
+        _host = CreateHost(runtimeFactory, new FakePicker(_testDirectory));
+
+        Assert.That(OpenSelectedAndDrain(_host), Is.True);
+        _host.Dispatcher.DrainBackgroundAndUi();
+        MinecraftWorkspaceReadOnlyDocument document = _host.Controller.ActiveDocument!;
+        MinecraftWorkspaceReadOnlyControl control = document.WorkspaceControl;
+        MinecraftWorkspaceTimelineFilterQuery? lastUiQuery = null;
+        List<MinecraftWorkspaceTimelineFilterQuery> emittedQueries = [];
+        control.FilterQueryChanged += (_, args) =>
+        {
+            MinecraftWorkspaceTimelineFilterQuery query = args.Query;
+            lastUiQuery = query;
+            emittedQueries.Add(query);
+        };
+        PumpUntil(_host, () => control.Snapshot.Rows.Any(row => row.Details.RawText.Contains("synthetic-initial", StringComparison.Ordinal)));
+
+        int unknownSourceIndex = control.SourceFacetList.Items
+            .Cast<MinecraftWorkspaceFacetEditorItem<MinecraftWorkspaceFacetValue<string>>>()
+            .ToList()
+            .FindIndex(item => item.Value.IsUnknown);
+        int yeezusSourceIndex = control.SourceFacetList.Items
+            .Cast<MinecraftWorkspaceFacetEditorItem<MinecraftWorkspaceFacetValue<string>>>()
+            .ToList()
+            .FindIndex(item => !item.Value.IsUnknown && item.Value.Value == "Yeezus");
+        int cactusMonitorIndex = control.ComponentFacetList.Items
+            .Cast<MinecraftWorkspaceFacetEditorItem<MinecraftWorkspaceFacetValue<string>>>()
+            .ToList()
+            .FindIndex(item => !item.Value.IsUnknown && item.Value.Value == "CactusMonitor");
+        control.SourceFacetList.SetItemChecked(unknownSourceIndex, true);
+        control.ComponentFacetList.SetItemChecked(cactusMonitorIndex, true);
+        PumpUntil(_host, () => ReferenceEquals(control.Snapshot.QuerySnapshot, lastUiQuery));
+        Assert.That(control.Snapshot.Rows, Is.Empty, "Unknown source AND CactusMonitor should not match the latest.log event.");
+
+        control.SourceFacetList.SetItemChecked(yeezusSourceIndex, true);
+        PumpUntil(_host, () => ReferenceEquals(control.Snapshot.QuerySnapshot, lastUiQuery));
+        MinecraftWorkspaceReadOnlyRow selected = control.Snapshot.Rows.Single(row => row.Details.RawText.Contains("synthetic-initial", StringComparison.Ordinal));
+        long selectedIdentity = selected.Identity;
+        EventRef selectedEventRef = selected.Details.EventRef;
+        FileRef selectedFileRef = selected.Details.FileRef;
+        MinecraftWorkspaceTimelineFilterQuery appliedQuery = lastUiQuery!;
+        int selectedRowBeforeLiveUpdates = control.Snapshot.Rows.ToList().FindIndex(row => row.Identity == selectedIdentity);
+        control.EventGrid.CurrentCell = control.EventGrid.Rows[selectedRowBeforeLiveUpdates].Cells[0];
+        control.EventGrid.Rows[selectedRowBeforeLiveUpdates].Selected = true;
+        Application.DoEvents();
+
+        long matchingAppendTimestamp = Utc("2099-01-01T10:05:00Z").ToUnixTimeMilliseconds();
+        File.AppendAllText(
+            initialCfmPath,
+            $"{{\"type\":\"CYCLE\",\"sessionId\":\"synthetic-initial\",\"sequence\":2,\"timestampEpochMillis\":{matchingAppendTimestamp}}}\n",
+            new UTF8Encoding(false));
+        File.AppendAllText(latestPath, "[18:41:04] [Render thread/INFO] synthetic nonmatching live append\n", new UTF8Encoding(false));
+        PumpUntil(_host, () => control.Snapshot.Rows.Any(row => row.Details.RawText.Contains("\"sequence\":2", StringComparison.Ordinal)));
+
+        int previousFileFacetCount = control.FileFacetList.Items.Count;
+        string latePath = CreateFile(
+            "cactusmonitor/sessions/cfm-late.jsonl",
+            $"{{\"type\":\"CYCLE\",\"sessionId\":\"synthetic-late\",\"sequence\":1,\"timestampEpochMillis\":{Utc("2099-01-01T10:01:00Z").ToUnixTimeMilliseconds()}}}\n");
+        PumpUntil(_host, () => control.Snapshot.Rows.Any(row => row.Details.RawText.Contains("synthetic-late", StringComparison.Ordinal)) &&
+            control.FileFacetList.Items.Count > previousFileFacetCount);
+        MinecraftWorkspaceReadOnlyRow late = control.Snapshot.Rows.Single(row => row.Details.RawText.Contains("synthetic-late", StringComparison.Ordinal));
+        int lateRowIndex = control.Snapshot.Rows.ToList().FindIndex(row => row.Identity == late.Identity);
+        int selectedRowIndex = control.Snapshot.Rows.ToList().FindIndex(row => row.Identity == selectedIdentity);
+        string lateFileId = runtimeFactory.LastRuntime!.Discovery.Rescan().Files.Single(source => source.FullPath == latePath).FileId;
+        MinecraftWorkspaceFacetEditorItem<string> lateFileFacet = control.FileFacetList.Items
+            .Cast<MinecraftWorkspaceFacetEditorItem<string>>()
+            .Single(item => item.Value == lateFileId);
+        int lateFacetIndex = control.FileFacetList.Items.IndexOf(lateFileFacet);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(emittedQueries, Has.Count.EqualTo(3));
+            Assert.That(appliedQuery.Sources, Has.Count.EqualTo(2));
+            Assert.That(appliedQuery.Sources.Any(value => value.IsUnknown), Is.True);
+            Assert.That(appliedQuery.Sources.Any(value => !value.IsUnknown && value.Value == "Yeezus"), Is.True);
+            Assert.That(appliedQuery.Components, Is.EqualTo(new[] { MinecraftWorkspaceFacetValues.Known("CactusMonitor") }));
+            Assert.That(control.Snapshot.QuerySnapshot, Is.SameAs(lastUiQuery));
+            Assert.That(control.Snapshot.TotalLoadedCount, Is.GreaterThanOrEqualTo(6), "The matching append and nonmatching latest.log append must both be ingested.");
+            Assert.That(control.Snapshot.Rows.Any(row => row.Details.RawText.Contains("synthetic nonmatching live append", StringComparison.Ordinal)), Is.False);
+            Assert.That(late.IsLate, Is.True);
+            Assert.That(lateRowIndex, Is.LessThan(selectedRowIndex));
+            Assert.That(lateFileFacet.Bucket, Is.SameAs(lateFileFacet.DisplayItem.Bucket));
+            Assert.That(lateFileFacet.DisplayItem.Bucket.TotalCount, Is.EqualTo(1));
+            Assert.That(control.FileFacetList.GetItemChecked(lateFacetIndex), Is.False);
+            Assert.That(control.SelectedIdentity, Is.EqualTo(selectedIdentity));
+            Assert.That(control.SelectedDetails!.EventRef, Is.SameAs(selectedEventRef));
+            Assert.That(control.SelectedDetails.FileRef, Is.SameAs(selectedFileRef));
+            Assert.That(control.SelectedEntry!.Identity, Is.EqualTo(selectedIdentity));
+            Assert.That(control.Snapshot.Rows.Select(row => row.Identity).Distinct().Count(), Is.EqualTo(control.Snapshot.Rows.Count));
+            Assert.That(control.Snapshot.Rows.Any(row => row.Details.PhysicalPath == latestPath), Is.False);
+        });
+
+        control.ClearFiltersButton.PerformClick();
+        MinecraftWorkspaceTimelineFilterQuery clearQuery = lastUiQuery!;
+        PumpUntil(_host, () => ReferenceEquals(control.Snapshot.QuerySnapshot, clearQuery) &&
+            control.Snapshot.Rows.Count == control.Snapshot.TotalLoadedCount);
+        Assert.Multiple(() =>
+        {
+            Assert.That(clearQuery.SearchText, Is.Null);
+            Assert.That(clearQuery.Sources, Is.Empty);
+            Assert.That(clearQuery.Components, Is.Empty);
+            Assert.That(control.Snapshot.Rows.Any(row => row.Details.PhysicalPath == latestPath), Is.True);
+            Assert.That(control.SelectedIdentity, Is.EqualTo(selectedIdentity));
+        });
+
+        document.Close();
+        Assert.That(_host.Controller.ActiveDocument, Is.Null);
+    }
+
     private TestHost CreateHost (
         IMinecraftWorkspaceHostRuntimeFactory runtimeFactory,
         FakePicker picker)
@@ -505,7 +733,10 @@ public sealed class MinecraftWorkspaceHostControllerTests
             Thread.Sleep(10);
         }
 
-        Assert.That(condition(), Is.True, "The real reader/session path did not publish the expected synthetic log event.");
+        Assert.That(condition(), Is.True,
+            $"The real reader/session path did not publish the expected synthetic log event. Rows={host.Controller.ActiveDocument?.WorkspaceControl.Snapshot.Rows.Count}, " +
+            $"Loaded={host.Controller.ActiveDocument?.WorkspaceControl.Snapshot.TotalLoadedCount}, " +
+            $"Query={host.Controller.ActiveDocument?.WorkspaceControl.Snapshot.QuerySnapshot.SearchText}");
     }
 
     private string CreateFile (string relativePath, string contents)
@@ -516,6 +747,9 @@ public sealed class MinecraftWorkspaceHostControllerTests
         return fullPath;
     }
 
+    private static DateTimeOffset Utc (string value) =>
+        DateTimeOffset.Parse(value, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal);
+
     private static MinecraftWorkspaceReadOnlyViewSnapshot Snapshot (string displayName)
     {
         MinecraftWorkspaceTimeline timeline = new("test-workspace");
@@ -523,6 +757,32 @@ public sealed class MinecraftWorkspaceHostControllerTests
             timeline.GetOrderedSnapshot(),
             new MinecraftWorkspaceTimelineFilterQuery());
         return MinecraftWorkspaceReadOnlyViewPresenter.CreateSnapshot(displayName, result);
+    }
+
+    private static MinecraftWorkspaceIngressEvent CreateHostIngress (string fileId, long sequence, string message)
+    {
+        DateTimeOffset timestamp = DateTimeOffset.Parse("2030-01-01T10:00:00Z", CultureInfo.InvariantCulture);
+        FileRef file = new(fileId, $"F:/synthetic/{fileId}.log", 1);
+        EventRef eventRef = new(file, sequence, sequence * 100, sequence * 100 + 50, sequence, sequence);
+        NormalizedLogEvent normalized = new(
+            eventRef,
+            Attribution.Unknown<string>(),
+            Attribution.Unknown<string>(),
+            Attribution.Unknown<LogLevel>(),
+            null,
+            Attribution.Unknown<string>(),
+            EventTimestamp.FromSource(timestamp, timestamp.ToString("O", CultureInfo.InvariantCulture)),
+            EventParseStatus.Parsed,
+            message,
+            message);
+        return new MinecraftWorkspaceIngressEvent(
+            sequence,
+            "host-query-workspace",
+            fileId,
+            fileId,
+            MinecraftSourceSegmentRole.Primary,
+            normalized,
+            timestamp);
     }
 
     private sealed class TestHost (
@@ -614,7 +874,11 @@ public sealed class MinecraftWorkspaceHostControllerTests
 
         public List<int> RefreshThreadIds { get; } = [];
 
-        public MinecraftWorkspaceReadOnlyViewSnapshot Refresh ()
+        public Func<int, MinecraftWorkspaceTimelineFilterQuery, MinecraftWorkspaceReadOnlyViewSnapshot>? QuerySnapshotFactory { get; set; }
+
+        public List<MinecraftWorkspaceTimelineFilterQuery> RefreshQueries { get; } = [];
+
+        public MinecraftWorkspaceReadOnlyViewSnapshot Refresh (MinecraftWorkspaceTimelineFilterQuery query)
         {
             int active = Interlocked.Increment(ref _activeRefreshes);
             int previousMaximum;
@@ -630,10 +894,11 @@ public sealed class MinecraftWorkspaceHostControllerTests
                 lock (RefreshThreadIds)
                 {
                     RefreshThreadIds.Add(Environment.CurrentManagedThreadId);
+                    RefreshQueries.Add(query);
                 }
 
                 OnRefresh?.Invoke(call);
-                return snapshotFactory(call);
+                return QuerySnapshotFactory?.Invoke(call, query) ?? snapshotFactory(call);
             }
             finally
             {

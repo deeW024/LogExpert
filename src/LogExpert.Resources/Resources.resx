@@ -2371,4 +2371,7 @@ Restart LogExpert to apply changes?</value>
   <data name="MarkerBar_ToolTip" xml:space="preserve"><value>{0}: lines {1}–{2}, {3} matching lines</value></data>
   <data name="MarkerBar_ScanFailed" xml:space="preserve"><value>Marker discovery failed: {0}</value></data>
   <data name="MarkerBar_Title" xml:space="preserve"><value>Marker bar</value></data>
+  <data name="MinecraftWorkspace_Filter_SearchIn" xml:space="preserve"><value>Search in</value></data>
+  <data name="MinecraftWorkspace_Filter_Invert" xml:space="preserve"><value>Invert</value></data>
+  <data name="MinecraftWorkspace_Filter_ClearAll" xml:space="preserve"><value>Clear all filters</value></data>
 </root>

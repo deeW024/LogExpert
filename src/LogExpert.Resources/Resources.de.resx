@@ -2355,4 +2355,13 @@ LogExpert neu starten, um die Änderungen zu übernehmen?</value>
   <data name="MarkerBar_Title" xml:space="preserve">
     <value>Markierungsleiste</value>
   </data>
+  <data name="MinecraftWorkspace_Filter_SearchIn" xml:space="preserve">
+    <value>Suchen in</value>
+  </data>
+  <data name="MinecraftWorkspace_Filter_Invert" xml:space="preserve">
+    <value>Invertieren</value>
+  </data>
+  <data name="MinecraftWorkspace_Filter_ClearAll" xml:space="preserve">
+    <value>Alle Filter löschen</value>
+  </data>
 </root>

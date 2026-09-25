@@ -2249,4 +2249,13 @@ YY[YY] = 年
   <data name="MarkerBar_Title" xml:space="preserve">
     <value>标记栏</value>
   </data>
+  <data name="MinecraftWorkspace_Filter_SearchIn" xml:space="preserve">
+    <value>搜索范围</value>
+  </data>
+  <data name="MinecraftWorkspace_Filter_Invert" xml:space="preserve">
+    <value>反转结果</value>
+  </data>
+  <data name="MinecraftWorkspace_Filter_ClearAll" xml:space="preserve">
+    <value>清除所有筛选器</value>
+  </data>
 </root>

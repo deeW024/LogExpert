@@ -53,6 +53,7 @@ public sealed class MinecraftWorkspaceReadOnlyViewTests
         Assert.Multiple(() =>
         {
             Assert.That(snapshot.WorkspaceDisplayName, Is.EqualTo("Synthetic workspace"));
+            Assert.That(snapshot.QuerySnapshot, Is.SameAs(result.QuerySnapshot));
             Assert.That(snapshot.FilterStatus, Is.EqualTo(MinecraftWorkspaceFilterStatus.Success));
             Assert.That(snapshot.TotalLoadedCount, Is.Zero);
             Assert.That(snapshot.MatchedCount, Is.Zero);
@@ -440,15 +441,402 @@ public sealed class MinecraftWorkspaceReadOnlyViewTests
             CreateIngress(1, "unknown-file", 1, "unknown row", Utc("2030-01-01T10:00:00Z")));
         using var control = new MinecraftWorkspaceReadOnlyControl(snapshot);
 
-        TreeNode sourceGroup = control.FacetTree.Nodes["Source"]!;
+        MinecraftWorkspaceFacetEditorItem<MinecraftWorkspaceFacetValue<string>> sourceUnknown =
+            control.SourceFacetList.Items.Cast<MinecraftWorkspaceFacetEditorItem<MinecraftWorkspaceFacetValue<string>>>()
+                .Single(item => item.Value.IsUnknown);
 
         Assert.Multiple(() =>
         {
             Assert.That(snapshot.Rows.Single().Source, Is.EqualTo("Unknown"));
-            Assert.That(sourceGroup.Nodes.Cast<TreeNode>().Any(node =>
-                node.Text.Contains("Unknown", StringComparison.Ordinal) &&
-                node.Text.Contains("Total: 1", StringComparison.Ordinal) &&
-                node.Text.Contains("Matching: 1", StringComparison.Ordinal)), Is.True);
+            Assert.That(sourceUnknown.DisplayText, Does.Contain("Unknown"));
+            Assert.That(sourceUnknown.DisplayText, Does.Contain("Total: 1"));
+            Assert.That(sourceUnknown.DisplayText, Does.Contain("Matching: 1"));
+        });
+    }
+
+    [Test]
+    public void Control_shows_regex_timeout_as_an_incomplete_filter_result ()
+    {
+        string catastrophicInput = new string('a', 50_000) + "!";
+        MinecraftWorkspaceTimeline timeline = Timeline([
+            CreateIngress(1, "timeout-control-file", 1, catastrophicInput, Utc("2030-01-01T10:00:00Z"))]);
+        MinecraftWorkspaceTimelineFilterResult timeout = new MinecraftWorkspaceTimelineFilter().Evaluate(
+            timeline.GetOrderedSnapshot(),
+            new MinecraftWorkspaceTimelineFilterQuery(searchText: "^(a+)+$", isRegex: true));
+        using MinecraftWorkspaceReadOnlyControl control = new(ViewSnapshot(timeout));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(control.StatusLabel.Text, Does.Contain("RegexTimedOut"));
+            Assert.That(control.StatusLabel.Text, Does.Contain("Matched: incomplete"));
+            Assert.That(control.StatusLabel.Text, Does.Contain(timeout.ErrorDetail));
+            Assert.That(control.EventGrid.RowCount, Is.Zero);
+        });
+    }
+
+    [Test]
+    public void Filter_editor_emits_complete_query_and_YEE50_keeps_typed_unknown_distinct_from_known_literal ()
+    {
+        MinecraftWorkspaceIngressEvent unknownSource = CreateIngress(
+            1,
+            "unknown-source-file",
+            1,
+            "unknown source event",
+            Utc("2030-01-01T10:00:00Z"),
+            component: Attribution.From("Core", AttributionProvenance.Parsed, AttributionConfidence.High));
+        MinecraftWorkspaceIngressEvent knownUnknownSource = CreateIngress(
+            2,
+            "known-unknown-file",
+            1,
+            "known literal event",
+            Utc("2030-01-01T10:01:00Z"),
+            source: Attribution.From("Unknown", AttributionProvenance.ExplicitMetadata, AttributionConfidence.Exact),
+            component: Attribution.From("Core", AttributionProvenance.Parsed, AttributionConfidence.High));
+        MinecraftWorkspaceIngressEvent otherSource = CreateIngress(
+            3,
+            "other-source-file",
+            1,
+            "different component event",
+            Utc("2030-01-01T10:02:00Z"),
+            source: Attribution.From("Yeezus", AttributionProvenance.ExplicitMetadata, AttributionConfidence.Exact),
+            component: Attribution.From("Network", AttributionProvenance.Parsed, AttributionConfidence.High));
+        MinecraftWorkspaceTimeline timeline = Timeline([unknownSource, knownUnknownSource, otherSource]);
+        using Form form = CreateForm();
+        using MinecraftWorkspaceReadOnlyControl control = new(ViewSnapshot(FilterResult([unknownSource, knownUnknownSource, otherSource])));
+        form.Controls.Add(control);
+        form.Show();
+        Application.DoEvents();
+        List<MinecraftWorkspaceTimelineFilterQuery> emittedQueries = [];
+        control.FilterQueryChanged += (_, args) => emittedQueries.Add(args.Query);
+
+        MinecraftWorkspaceFacetEditorItem<MinecraftWorkspaceFacetValue<string>>[] sourceItems = control.SourceFacetList.Items
+            .Cast<MinecraftWorkspaceFacetEditorItem<MinecraftWorkspaceFacetValue<string>>>()
+            .ToArray();
+        int unknownIndex = Array.FindIndex(sourceItems, item => item.Value.IsUnknown);
+        int knownLiteralIndex = Array.FindIndex(sourceItems, item => !item.Value.IsUnknown && item.Value.Value == "Unknown");
+        int coreIndex = control.ComponentFacetList.Items
+            .Cast<MinecraftWorkspaceFacetEditorItem<MinecraftWorkspaceFacetValue<string>>>()
+            .ToList()
+            .FindIndex(item => !item.Value.IsUnknown && item.Value.Value == "Core");
+
+        control.SourceFacetList.SetItemChecked(unknownIndex, true);
+        control.SourceFacetList.SetItemChecked(knownLiteralIndex, true);
+        control.ComponentFacetList.SetItemChecked(coreIndex, true);
+        MinecraftWorkspaceTimelineFilterQuery query = emittedQueries[^1];
+        MinecraftWorkspaceTimelineFilterResult result = new MinecraftWorkspaceTimelineFilter().Evaluate(timeline.GetOrderedSnapshot(), query);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(unknownIndex, Is.GreaterThanOrEqualTo(0));
+            Assert.That(knownLiteralIndex, Is.GreaterThanOrEqualTo(0));
+            Assert.That(coreIndex, Is.GreaterThanOrEqualTo(0));
+            Assert.That(query.Sources, Has.Count.EqualTo(2));
+            Assert.That(query.Sources.Any(value => value.IsUnknown), Is.True);
+            Assert.That(query.Sources.Any(value => !value.IsUnknown && value.Value == "Unknown"), Is.True);
+            Assert.That(query.Components, Has.Count.EqualTo(1));
+            Assert.That(result.QuerySnapshot, Is.SameAs(query));
+            Assert.That(result.MatchedEntries.Select(entry => entry.Identity), Is.EqualTo(new long[] { 1, 2 }));
+            Assert.That(sourceItems.Count(item => item.Value.IsUnknown || (!item.Value.IsUnknown && item.Value.Value == "Unknown")), Is.EqualTo(2));
+            Assert.That(sourceItems[knownLiteralIndex].DisplayItem.DisplayLabel, Is.EqualTo("\"Unknown\" (literal)"));
+        });
+
+        control.SourceFacetList.SetItemChecked(knownLiteralIndex, false);
+        MinecraftWorkspaceTimelineFilterQuery unknownOnlyQuery = emittedQueries[^1];
+        MinecraftWorkspaceTimelineFilterResult unknownOnly = new MinecraftWorkspaceTimelineFilter().Evaluate(
+            timeline.GetOrderedSnapshot(),
+            unknownOnlyQuery);
+        int eventCountBeforeApply = emittedQueries.Count;
+        control.ApplySnapshot(ViewSnapshot(unknownOnly));
+        MinecraftWorkspaceFacetEditorItem<MinecraftWorkspaceFacetValue<string>>[] reboundSources = control.SourceFacetList.Items
+            .Cast<MinecraftWorkspaceFacetEditorItem<MinecraftWorkspaceFacetValue<string>>>()
+            .ToArray();
+        int reboundUnknown = Array.FindIndex(reboundSources, item => item.Value.IsUnknown);
+        int reboundKnownLiteral = Array.FindIndex(reboundSources, item => !item.Value.IsUnknown && item.Value.Value == "Unknown");
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(control.SourceFacetList.GetItemChecked(reboundUnknown), Is.True);
+            Assert.That(control.SourceFacetList.GetItemChecked(reboundKnownLiteral), Is.False);
+            Assert.That(emittedQueries, Has.Count.EqualTo(eventCountBeforeApply));
+            Assert.That(control.Snapshot.QuerySnapshot, Is.SameAs(unknownOnlyQuery));
+        });
+    }
+
+    [Test]
+    public void Filter_editor_maps_text_options_and_clear_all_to_one_complete_query ()
+    {
+        MinecraftWorkspaceReadOnlyViewSnapshot initial = ViewSnapshot(
+            CreateIngress(1, "text-options", 1, "message value", Utc("2030-01-01T10:00:00Z"), rawText: "raw value"));
+        using Form form = CreateForm();
+        using MinecraftWorkspaceReadOnlyControl control = new(initial);
+        form.Controls.Add(control);
+        form.Show();
+        Application.DoEvents();
+        List<MinecraftWorkspaceTimelineFilterQuery> emitted = [];
+        control.FilterQueryChanged += (_, args) => emitted.Add(args.Query);
+
+        control.SearchTextBox.Text = "message phrase";
+        Assert.Multiple(() =>
+        {
+            Assert.That(emitted[^1].SearchText, Is.EqualTo("message phrase"));
+            Assert.That(emitted[^1].TextScope, Is.EqualTo(MinecraftWorkspaceTextScope.Message));
+        });
+        control.SearchTextBox.Text = "^raw\\s+value$";
+        control.TextScopeComboBox.SelectedIndex = (int)MinecraftWorkspaceTextScope.RawText;
+        control.RegexCheckBox.Checked = true;
+        control.CaseSensitiveCheckBox.Checked = true;
+        control.InvertCheckBox.Checked = true;
+        MinecraftWorkspaceTimelineFilterQuery complete = emitted[^1];
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(complete.SearchText, Is.EqualTo("^raw\\s+value$"));
+            Assert.That(complete.TextScope, Is.EqualTo(MinecraftWorkspaceTextScope.RawText));
+            Assert.That(complete.IsRegex, Is.True);
+            Assert.That(complete.IsCaseSensitive, Is.True);
+            Assert.That(complete.IsInvert, Is.True);
+            Assert.That(complete.FileIds, Is.Empty);
+            Assert.That(complete.Sources, Is.Empty);
+            Assert.That(complete.Components, Is.Empty);
+            Assert.That(complete.Levels, Is.Empty);
+            Assert.That(complete.Threads, Is.Empty);
+        });
+
+        foreach (MinecraftWorkspaceTextScope scope in Enum.GetValues<MinecraftWorkspaceTextScope>())
+        {
+            control.TextScopeComboBox.SelectedIndex = (int)scope;
+            Assert.That(emitted[^1].TextScope, Is.EqualTo(scope));
+        }
+
+        int beforeApply = emitted.Count;
+        control.ApplySnapshot(ViewSnapshot(new MinecraftWorkspaceTimelineFilter().Evaluate(
+            Timeline([CreateIngress(1, "text-options", 1, "message value", Utc("2030-01-01T10:00:00Z"), rawText: "raw value")]).GetOrderedSnapshot(),
+            complete)));
+        Assert.That(emitted, Has.Count.EqualTo(beforeApply), "Applying the exact YEE-50 snapshot query must not emit a recursive query change.");
+
+        control.ClearFiltersButton.PerformClick();
+        MinecraftWorkspaceTimelineFilterQuery cleared = emitted[^1];
+        Assert.Multiple(() =>
+        {
+            Assert.That(cleared.SearchText, Is.Null);
+            Assert.That(cleared.TextScope, Is.EqualTo(MinecraftWorkspaceTextScope.Message));
+            Assert.That(cleared.IsRegex, Is.False);
+            Assert.That(cleared.IsCaseSensitive, Is.False);
+            Assert.That(cleared.IsInvert, Is.False);
+            Assert.That(cleared.FileIds, Is.Empty);
+            Assert.That(cleared.Sources, Is.Empty);
+            Assert.That(cleared.Components, Is.Empty);
+            Assert.That(cleared.Levels, Is.Empty);
+            Assert.That(cleared.Threads, Is.Empty);
+        });
+    }
+
+    [Test]
+    public void Filter_editor_maps_file_id_and_typed_unknown_component_level_and_thread_values ()
+    {
+        MinecraftWorkspaceIngressEvent unknown = CreateIngress(
+            1, "exact-file-id", 1, "unknown event", Utc("2030-01-01T10:00:00Z"));
+        MinecraftWorkspaceIngressEvent known = CreateIngress(
+            2,
+            "known-values-file",
+            1,
+            "known event",
+            Utc("2030-01-01T10:01:00Z"),
+            source: Attribution.From("Yeezus", AttributionProvenance.ExplicitMetadata, AttributionConfidence.Exact),
+            component: Attribution.From("Core", AttributionProvenance.Parsed, AttributionConfidence.High),
+            level: Attribution.From(LogLevel.Error, AttributionProvenance.Parsed, AttributionConfidence.High),
+            thread: Attribution.From("Client thread", AttributionProvenance.Parsed, AttributionConfidence.High));
+        using Form form = CreateForm();
+        using MinecraftWorkspaceReadOnlyControl control = new(ViewSnapshot(unknown, known));
+        form.Controls.Add(control);
+        form.Show();
+        Application.DoEvents();
+        List<MinecraftWorkspaceTimelineFilterQuery> emitted = [];
+        control.FilterQueryChanged += (_, args) => emitted.Add(args.Query);
+
+        int fileIndex = control.FileFacetList.Items
+            .Cast<MinecraftWorkspaceFacetEditorItem<string>>()
+            .ToList()
+            .FindIndex(item => item.Value == unknown.FileId);
+        int unknownComponentIndex = control.ComponentFacetList.Items
+            .Cast<MinecraftWorkspaceFacetEditorItem<MinecraftWorkspaceFacetValue<string>>>()
+            .ToList()
+            .FindIndex(item => item.Value.IsUnknown);
+        int unknownLevelIndex = control.LevelFacetList.Items
+            .Cast<MinecraftWorkspaceFacetEditorItem<MinecraftWorkspaceFacetValue<LogLevel>>>()
+            .ToList()
+            .FindIndex(item => item.Value.IsUnknown);
+        int unknownThreadIndex = control.ThreadFacetList.Items
+            .Cast<MinecraftWorkspaceFacetEditorItem<MinecraftWorkspaceFacetValue<string>>>()
+            .ToList()
+            .FindIndex(item => item.Value.IsUnknown);
+        control.FileFacetList.SetItemChecked(fileIndex, true);
+        control.ComponentFacetList.SetItemChecked(unknownComponentIndex, true);
+        control.LevelFacetList.SetItemChecked(unknownLevelIndex, true);
+        control.ThreadFacetList.SetItemChecked(unknownThreadIndex, true);
+        MinecraftWorkspaceTimelineFilterQuery query = emitted[^1];
+        MinecraftWorkspaceTimelineFilterResult result = new MinecraftWorkspaceTimelineFilter().Evaluate(
+            Timeline([unknown, known]).GetOrderedSnapshot(),
+            query);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(query.FileIds, Is.EqualTo(new[] { unknown.FileId }));
+            Assert.That(query.Components.Single().IsUnknown, Is.True);
+            Assert.That(query.Levels.Single().IsUnknown, Is.True);
+            Assert.That(query.Threads.Single().IsUnknown, Is.True);
+            Assert.That(result.QuerySnapshot, Is.SameAs(query));
+            Assert.That(result.MatchedEntries.Select(entry => entry.Identity), Is.EqualTo(new long[] { unknown.IngressSequence }));
+            AssertEditorBucketsPreserved(control.FileFacetList, control.Snapshot.Facets.FileIds);
+            AssertEditorBucketsPreserved(control.SourceFacetList, control.Snapshot.Facets.Sources);
+            AssertEditorBucketsPreserved(control.ComponentFacetList, control.Snapshot.Facets.Components);
+            AssertEditorBucketsPreserved(control.LevelFacetList, control.Snapshot.Facets.Levels);
+            AssertEditorBucketsPreserved(control.ThreadFacetList, control.Snapshot.Facets.Threads);
+        });
+    }
+
+    [Test]
+    public void Filter_editor_combines_source_and_level_facets_with_AND_semantics ()
+    {
+        MinecraftWorkspaceIngressEvent matching = CreateIngress(
+            1,
+            "yee-error",
+            1,
+            "matching event",
+            Utc("2030-01-01T10:00:00Z"),
+            source: Attribution.From("Yeezus", AttributionProvenance.ExplicitMetadata, AttributionConfidence.Exact),
+            level: Attribution.From(LogLevel.Error, AttributionProvenance.Parsed, AttributionConfidence.High));
+        MinecraftWorkspaceIngressEvent wrongLevel = CreateIngress(
+            2,
+            "yee-info",
+            1,
+            "wrong level",
+            Utc("2030-01-01T10:01:00Z"),
+            source: Attribution.From("Yeezus", AttributionProvenance.ExplicitMetadata, AttributionConfidence.Exact),
+            level: Attribution.From(LogLevel.Info, AttributionProvenance.Parsed, AttributionConfidence.High));
+        MinecraftWorkspaceIngressEvent wrongSource = CreateIngress(
+            3,
+            "other-error",
+            1,
+            "wrong source",
+            Utc("2030-01-01T10:02:00Z"),
+            source: Attribution.From("ReCactus", AttributionProvenance.ExplicitMetadata, AttributionConfidence.Exact),
+            level: Attribution.From(LogLevel.Error, AttributionProvenance.Parsed, AttributionConfidence.High));
+        MinecraftWorkspaceTimeline timeline = Timeline([matching, wrongLevel, wrongSource]);
+        using Form form = CreateForm();
+        using MinecraftWorkspaceReadOnlyControl control = new(ViewSnapshot(matching, wrongLevel, wrongSource));
+        form.Controls.Add(control);
+        form.Show();
+        Application.DoEvents();
+        MinecraftWorkspaceTimelineFilterQuery? emittedQuery = null;
+        control.FilterQueryChanged += (_, args) => emittedQuery = args.Query;
+        int yeezus = control.SourceFacetList.Items
+            .Cast<MinecraftWorkspaceFacetEditorItem<MinecraftWorkspaceFacetValue<string>>>()
+            .ToList()
+            .FindIndex(item => !item.Value.IsUnknown && item.Value.Value == "Yeezus");
+        int error = control.LevelFacetList.Items
+            .Cast<MinecraftWorkspaceFacetEditorItem<MinecraftWorkspaceFacetValue<LogLevel>>>()
+            .ToList()
+            .FindIndex(item => !item.Value.IsUnknown && item.Value.Value == LogLevel.Error);
+        control.SourceFacetList.SetItemChecked(yeezus, true);
+        control.LevelFacetList.SetItemChecked(error, true);
+        MinecraftWorkspaceTimelineFilterResult filtered = new MinecraftWorkspaceTimelineFilter().Evaluate(
+            timeline.GetOrderedSnapshot(),
+            emittedQuery!);
+
+        Assert.That(filtered.MatchedEntries.Select(entry => entry.Identity), Is.EqualTo(new[] { matching.IngressSequence }));
+    }
+
+    [Test]
+    public void Filter_editor_uses_YEE50_for_message_raw_and_message_or_raw_text_scopes ()
+    {
+        MinecraftWorkspaceIngressEvent ingress = CreateIngress(
+            1,
+            "raw-scope-file",
+            1,
+            "visible headline",
+            Utc("2030-01-01T10:00:00Z"),
+            rawText: "visible headline\n    at synthetic.RawOnly.run(Stack.java:42)");
+        MinecraftWorkspaceTimeline timeline = Timeline([ingress]);
+        using Form form = CreateForm();
+        using MinecraftWorkspaceReadOnlyControl control = new(ViewSnapshot(ingress));
+        form.Controls.Add(control);
+        form.Show();
+        Application.DoEvents();
+        MinecraftWorkspaceTimelineFilterQuery? emittedQuery = null;
+        control.FilterQueryChanged += (_, args) => emittedQuery = args.Query;
+        control.SearchTextBox.Text = "RawOnly\\.run";
+        control.RegexCheckBox.Checked = true;
+
+        MinecraftWorkspaceTimelineFilterResult messageOnly = new MinecraftWorkspaceTimelineFilter().Evaluate(
+            timeline.GetOrderedSnapshot(), emittedQuery!);
+        control.TextScopeComboBox.SelectedIndex = (int)MinecraftWorkspaceTextScope.RawText;
+        MinecraftWorkspaceTimelineFilterResult rawOnly = new MinecraftWorkspaceTimelineFilter().Evaluate(
+            timeline.GetOrderedSnapshot(), emittedQuery!);
+        control.TextScopeComboBox.SelectedIndex = (int)MinecraftWorkspaceTextScope.MessageOrRawText;
+        MinecraftWorkspaceTimelineFilterResult either = new MinecraftWorkspaceTimelineFilter().Evaluate(
+            timeline.GetOrderedSnapshot(), emittedQuery!);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(messageOnly.MatchedEntries, Is.Empty);
+            Assert.That(rawOnly.MatchedEntries.Select(entry => entry.Identity), Is.EqualTo(new[] { ingress.IngressSequence }));
+            Assert.That(either.MatchedEntries.Select(entry => entry.Identity), Is.EqualTo(new[] { ingress.IngressSequence }));
+        });
+    }
+
+    [Test]
+    public void Filter_editor_preserves_exact_checked_values_and_leaves_new_buckets_unchecked_on_live_snapshot ()
+    {
+        MinecraftWorkspaceIngressEvent first = CreateIngress(
+            1,
+            "first-facet-file",
+            1,
+            "first source event",
+            Utc("2030-01-01T10:00:00Z"),
+            source: Attribution.From("First", AttributionProvenance.ExplicitMetadata, AttributionConfidence.Exact));
+        MinecraftWorkspaceIngressEvent second = CreateIngress(
+            2,
+            "second-facet-file",
+            1,
+            "new source event",
+            Utc("2030-01-01T10:01:00Z"),
+            source: Attribution.From("Second", AttributionProvenance.ExplicitMetadata, AttributionConfidence.Exact));
+        using Form form = CreateForm();
+        using MinecraftWorkspaceReadOnlyControl control = new(ViewSnapshot(first));
+        form.Controls.Add(control);
+        form.Show();
+        Application.DoEvents();
+        List<MinecraftWorkspaceTimelineFilterQuery> emitted = [];
+        control.FilterQueryChanged += (_, args) => emitted.Add(args.Query);
+        int firstSourceIndex = control.SourceFacetList.Items
+            .Cast<MinecraftWorkspaceFacetEditorItem<MinecraftWorkspaceFacetValue<string>>>()
+            .ToList()
+            .FindIndex(item => !item.Value.IsUnknown && item.Value.Value == "First");
+        control.SourceFacetList.SetItemChecked(firstSourceIndex, true);
+        MinecraftWorkspaceTimelineFilterQuery query = emitted[^1];
+        MinecraftWorkspaceTimelineFilterResult result = new MinecraftWorkspaceTimelineFilter().Evaluate(
+            Timeline([first, second]).GetOrderedSnapshot(),
+            query);
+        int emittedBeforeApply = emitted.Count;
+
+        control.ApplySnapshot(ViewSnapshot(result));
+
+        MinecraftWorkspaceFacetEditorItem<MinecraftWorkspaceFacetValue<string>>[] sources = control.SourceFacetList.Items
+            .Cast<MinecraftWorkspaceFacetEditorItem<MinecraftWorkspaceFacetValue<string>>>()
+            .ToArray();
+        int appliedFirstIndex = Array.FindIndex(sources, item => !item.Value.IsUnknown && item.Value.Value == "First");
+        int newSourceIndex = Array.FindIndex(sources, item => !item.Value.IsUnknown && item.Value.Value == "Second");
+        control.SearchTextBox.Text = "source";
+        MinecraftWorkspaceTimelineFilterQuery afterTextEdit = emitted[^1];
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(control.SourceFacetList.GetItemChecked(appliedFirstIndex), Is.True);
+            Assert.That(control.SourceFacetList.GetItemChecked(newSourceIndex), Is.False);
+            Assert.That(afterTextEdit.Sources, Is.EqualTo(query.Sources));
+            Assert.That(afterTextEdit.SearchText, Is.EqualTo("source"));
+            Assert.That(emittedBeforeApply, Is.EqualTo(1));
         });
     }
 
@@ -467,6 +855,35 @@ public sealed class MinecraftWorkspaceReadOnlyViewTests
             Assert.That(control.StatusLabel.Text, Does.Contain("Matched: incomplete"));
             Assert.That(control.EventGrid.RowCount, Is.Zero);
             Assert.That(control.SelectedEntry, Is.Null);
+        });
+    }
+
+    [Test]
+    public void Control_starts_with_the_canonical_empty_query_and_all_facets_unchecked ()
+    {
+        MinecraftWorkspaceTimelineFilterResult result = FilterResult([
+            CreateIngress(1, "empty-query-file", 1, "initial event", Utc("2030-01-01T10:00:00Z"))]);
+        using MinecraftWorkspaceReadOnlyControl control = new(ViewSnapshot(result));
+        MinecraftWorkspaceTimelineFilterQuery query = control.Snapshot.QuerySnapshot;
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(query, Is.SameAs(result.QuerySnapshot));
+            Assert.That(query.SearchText, Is.Null);
+            Assert.That(query.IsRegex, Is.False);
+            Assert.That(query.IsCaseSensitive, Is.False);
+            Assert.That(query.IsInvert, Is.False);
+            Assert.That(query.TextScope, Is.EqualTo(MinecraftWorkspaceTextScope.Message));
+            Assert.That(query.FileIds, Is.Empty);
+            Assert.That(query.Sources, Is.Empty);
+            Assert.That(query.Components, Is.Empty);
+            Assert.That(query.Levels, Is.Empty);
+            Assert.That(query.Threads, Is.Empty);
+            Assert.That(control.FileFacetList.CheckedItems, Is.Empty);
+            Assert.That(control.SourceFacetList.CheckedItems, Is.Empty);
+            Assert.That(control.ComponentFacetList.CheckedItems, Is.Empty);
+            Assert.That(control.LevelFacetList.CheckedItems, Is.Empty);
+            Assert.That(control.ThreadFacetList.CheckedItems, Is.Empty);
         });
     }
 
@@ -624,6 +1041,18 @@ public sealed class MinecraftWorkspaceReadOnlyViewTests
         for (int index = 0; index < originalBuckets.Count; index++)
         {
             Assert.That(displayItems[index].Bucket, Is.SameAs(originalBuckets[index]));
+        }
+    }
+
+    private static void AssertEditorBucketsPreserved<TValue> (
+        CheckedListBox list,
+        IReadOnlyList<MinecraftWorkspaceFacetDisplayItem<TValue>> originalItems)
+    {
+        Assert.That(list.Items.Count, Is.EqualTo(originalItems.Count));
+        for (int index = 0; index < originalItems.Count; index++)
+        {
+            MinecraftWorkspaceFacetEditorItem<TValue> item = (MinecraftWorkspaceFacetEditorItem<TValue>)list.Items[index]!;
+            Assert.That(item.DisplayItem, Is.SameAs(originalItems[index]));
         }
     }
 
