@@ -29,6 +29,7 @@ using LogExpert.UI.Services.SessionHandlerService;
 using LogExpert.UI.Services.TabControllerService;
 using LogExpert.UI.Services.ToolLaunchService;
 using LogExpert.UI.Services.ToolWindowCoordinatorService;
+using LogExpert.UI.Workspace;
 
 using NLog;
 
@@ -56,6 +57,7 @@ internal partial class LogTabWindow : Form, ILogTabWindow
     private readonly FileOperationService _fileOperationService;
     private readonly SessionHandler _sessionHandler;
     private readonly ToolLaunchService _toolLaunchService;
+    private readonly MinecraftWorkspaceHostController _minecraftWorkspaceHostController;
 
     private CancellationTokenSource? _dropCancellation;
     private FolderDropDialog? _dropDialog;
@@ -86,6 +88,22 @@ internal partial class LogTabWindow : Form, ILogTabWindow
 
     [SupportedOSPlatform("windows")]
     public LogTabWindow (string[] fileNames, int instanceNumber, bool showInstanceNumbers, IConfigManager configManager, int? targetLine = null)
+        : this(fileNames, instanceNumber, showInstanceNumbers, configManager, targetLine, null, null, null, null, null)
+    {
+    }
+
+    [SupportedOSPlatform("windows")]
+    internal LogTabWindow (
+        string[] fileNames,
+        int instanceNumber,
+        bool showInstanceNumbers,
+        IConfigManager configManager,
+        int? targetLine,
+        IMinecraftWorkspaceFolderPicker? folderPicker,
+        IMinecraftWorkspaceHostRuntimeFactory? runtimeFactory,
+        Func<IMinecraftWorkspaceRefreshTrigger>? triggerFactory,
+        IMinecraftWorkspaceHostDispatcher? dispatcher,
+        Action<Exception>? showWorkspaceError)
     {
         AutoScaleDimensions = new SizeF(96F, 96F);
         AutoScaleMode = AutoScaleMode.Dpi;
@@ -104,6 +122,22 @@ internal partial class LogTabWindow : Form, ILogTabWindow
         ApplyTextResources();
 
         ConfigManager = configManager;
+
+        _minecraftWorkspaceHostController = new MinecraftWorkspaceHostController(
+            this,
+            dockPanel,
+            folderPicker ?? new FolderBrowserMinecraftWorkspacePicker(),
+            runtimeFactory ?? new MinecraftWorkspaceHostRuntimeFactory(
+                PluginRegistry.PluginRegistry.Instance,
+                ConfigManager.Settings.Preferences.MaxLineLength),
+            triggerFactory ?? (static () => new WinFormsMinecraftWorkspaceRefreshTrigger()),
+            dispatcher ?? new WinFormsMinecraftWorkspaceHostDispatcher(this),
+            showWorkspaceError ?? (exception => _ = MessageBox.Show(
+                this,
+                exception.Message,
+                Resources.LogExpert_Common_UI_Title_Error,
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error)));
 
         _toolWindowCoordinator = new ToolWindowCoordinator(configManager);
 
@@ -288,6 +322,8 @@ internal partial class LogTabWindow : Form, ILogTabWindow
 
     public IConfigManager ConfigManager { get; }
 
+    internal MinecraftWorkspaceHostController WorkspaceHostController => _minecraftWorkspaceHostController;
+
     #endregion
 
     #region Internals
@@ -431,6 +467,7 @@ internal partial class LogTabWindow : Form, ILogTabWindow
         //File menu
         fileToolStripMenuItem.Text = Resources.LogTabWindow_UI_ToolStripMenuItem_fileToolStripMenuItem;
         openToolStripMenuItem.Text = Resources.LogTabWindow_UI_ToolStripMenuItem_openToolStripMenuItem;
+        openMinecraftWorkspaceToolStripMenuItem.Text = Resources.LogTabWindow_UI_ToolStripMenuItem_openMinecraftWorkspaceToolStripMenuItem;
         openURIToolStripMenuItem.Text = Resources.LogTabWindow_UI_ToolStripMenuItem_openURIToolStripMenuItem;
         closeFileToolStripMenuItem.Text = Resources.LogTabWindow_UI_ToolStripMenuItem_closeFileToolStripMenuItem;
         reloadToolStripMenuItem.Text = Resources.LogTabWindow_UI_ToolStripMenuItem_reloadToolStripMenuItem;
@@ -756,6 +793,7 @@ internal partial class LogTabWindow : Form, ILogTabWindow
         if (disposing)
         {
             CancelPendingDrop();
+            _minecraftWorkspaceHostController?.Dispose();
         }
 
         if (disposing && (components != null))
@@ -1762,6 +1800,7 @@ internal partial class LogTabWindow : Form, ILogTabWindow
         CancelPendingDrop();
         try
         {
+            _minecraftWorkspaceHostController.Dispose();
             IList<LogWindow.LogWindow> deleteLogWindowList = [];
             ConfigManager.Settings.AlwaysOnTop = TopMost && ConfigManager.Settings.Preferences.AllowOnlyOneInstance;
             _fileOperationService.SaveLastOpenFilesList();
@@ -1806,6 +1845,11 @@ internal partial class LogTabWindow : Form, ILogTabWindow
     private void OnExitToolStripMenuItemClick (object sender, EventArgs e)
     {
         Close();
+    }
+
+    private async void OnOpenMinecraftWorkspaceToolStripMenuItemClick (object? sender, EventArgs e)
+    {
+        _ = await _minecraftWorkspaceHostController.OpenSelectedWorkspaceAsync().ConfigureAwait(true);
     }
 
     private void OnSelectFilterToolStripMenuItemClick (object sender, EventArgs e)

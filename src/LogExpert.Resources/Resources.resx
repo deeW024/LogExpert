@@ -1143,6 +1143,9 @@ Checked tools will appear in the icon bar. All other tools are available in the 
   <data name="LogTabWindow_UI_ToolStripMenuItem_openToolStripMenuItem" xml:space="preserve">
         <value>Open...</value>
     </data>
+  <data name="LogTabWindow_UI_ToolStripMenuItem_openMinecraftWorkspaceToolStripMenuItem" xml:space="preserve">
+        <value>Open Minecraft Workspace…</value>
+    </data>
   <data name="LogTabWindow_UI_ToolStripMenuItem_openURIToolStripMenuItem" xml:space="preserve">
         <value>Open URL...</value>
     </data>

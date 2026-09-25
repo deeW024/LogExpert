@@ -2688,6 +2688,15 @@ namespace LogExpert {
                 return ResourceManager.GetString("LogTabWindow_UI_ToolStripMenuItem_openToolStripMenuItem", resourceCulture);
             }
         }
+
+        /// <summary>
+        ///   Looks up a localized string similar to Open Minecraft Workspace….
+        /// </summary>
+        public static string LogTabWindow_UI_ToolStripMenuItem_openMinecraftWorkspaceToolStripMenuItem {
+            get {
+                return ResourceManager.GetString("LogTabWindow_UI_ToolStripMenuItem_openMinecraftWorkspaceToolStripMenuItem", resourceCulture);
+            }
+        }
         
         /// <summary>
         ///   Looks up a localized string similar to Open URL....

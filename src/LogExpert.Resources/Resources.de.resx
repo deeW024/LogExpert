@@ -1195,6 +1195,9 @@ Ein ausgewähltes Tool erscheint in der Iconbar. Alle anderen verfügbaren Tools
   <data name="LogTabWindow_UI_ToolStripMenuItem_openToolStripMenuItem" xml:space="preserve">
 		<value>Öffnen...</value>
 	</data>
+  <data name="LogTabWindow_UI_ToolStripMenuItem_openMinecraftWorkspaceToolStripMenuItem" xml:space="preserve">
+		<value>Minecraft-Arbeitsbereich öffnen…</value>
+	</data>
   <data name="LogTabWindow_UI_ToolStripMenuItem_openURIToolStripMenuItem" xml:space="preserve">
 		<value>URL öffnen...</value>
 	</data>

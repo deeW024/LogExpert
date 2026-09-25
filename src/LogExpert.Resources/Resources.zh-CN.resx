@@ -1001,6 +1001,9 @@
   <data name="LogTabWindow_UI_ToolStripMenuItem_openToolStripMenuItem" xml:space="preserve">
     <value>打开...</value>
   </data>
+  <data name="LogTabWindow_UI_ToolStripMenuItem_openMinecraftWorkspaceToolStripMenuItem" xml:space="preserve">
+    <value>打开 Minecraft 工作区…</value>
+  </data>
   <data name="LogTabWindow_UI_ToolStripMenuItem_openURIToolStripMenuItem" xml:space="preserve">
     <value>打开 URL...</value>
   </data>
