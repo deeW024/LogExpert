@@ -403,6 +403,162 @@ public sealed class MinecraftWorkspaceReadOnlyViewTests
     }
 
     [Test]
+    public void Follow_defaults_on_tracks_user_scroll_and_tails_without_changing_selection_or_query ()
+    {
+        MinecraftWorkspaceIngressEvent[] events = Enumerable.Range(1, 60)
+            .Select(index => CreateIngress(
+                index,
+                "follow-file",
+                index,
+                $"follow event {index}",
+                Utc("2030-01-01T10:00:00Z").AddMinutes(index)))
+            .ToArray();
+        MinecraftWorkspaceReadOnlyViewSnapshot before = ViewSnapshot(events);
+        using var form = CreateForm();
+        using var control = new MinecraftWorkspaceReadOnlyControl(before);
+        form.Controls.Add(control);
+        form.Show();
+        Application.DoEvents();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(control.IsFollowEnabled, Is.True);
+            Assert.That(control.IsPaused, Is.False);
+            Assert.That(control.BacklogCount, Is.Zero);
+            Assert.That(IsAtTail(control.EventGrid), Is.True);
+        });
+
+        int selectedRow = Math.Min(12, control.EventGrid.RowCount - 1);
+        SelectRow(control, selectedRow);
+        long selectedIdentity = control.SelectedIdentity!.Value;
+        control.EventGrid.FirstDisplayedScrollingRowIndex = 0;
+        Application.DoEvents();
+        Assert.That(control.IsFollowEnabled, Is.False, "Manual scrolling away from the tail disables Follow.");
+
+        control.EventGrid.FirstDisplayedScrollingRowIndex = Math.Max(
+            0,
+            control.EventGrid.RowCount - control.EventGrid.DisplayedRowCount(includePartialRow: false));
+        Application.DoEvents();
+        Assert.That(control.IsFollowEnabled, Is.True, "Manual scrolling back to the tail re-enables Follow.");
+
+        control.EventGrid.FirstDisplayedScrollingRowIndex = 0;
+        Application.DoEvents();
+        control.FollowCheckBox.Checked = true;
+        Application.DoEvents();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(IsAtTail(control.EventGrid), Is.True, "Manually enabling Follow scrolls to the tail immediately.");
+            Assert.That(control.SelectedIdentity, Is.EqualTo(selectedIdentity));
+            Assert.That(control.Snapshot.QuerySnapshot.SearchText, Is.Null);
+        });
+
+        MinecraftWorkspaceIngressEvent appended = CreateIngress(
+            61,
+            "follow-file",
+            61,
+            "follow appended",
+            Utc("2030-01-01T12:00:00Z"));
+        MinecraftWorkspaceTimeline timeline = Timeline(events);
+        timeline.AppendBatch([appended]);
+        MinecraftWorkspaceReadOnlyViewSnapshot after = ViewSnapshot(new MinecraftWorkspaceTimelineFilter().Evaluate(
+            timeline.GetOrderedSnapshot(),
+            control.Snapshot.QuerySnapshot));
+        control.ApplySnapshot(after);
+        Application.DoEvents();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(IsAtTail(control.EventGrid), Is.True, "Follow keeps newly applied live rows at the tail.");
+            Assert.That(control.SelectedIdentity, Is.EqualTo(selectedIdentity));
+        });
+    }
+
+    [Test]
+    public void Follow_off_preserves_top_identity_and_selection_after_late_insertion_then_clamps_filtered_anchor ()
+    {
+        List<MinecraftWorkspaceIngressEvent> events = Enumerable.Range(1, 40)
+            .Select(index => CreateIngress(
+                index,
+                "anchor-file",
+                index,
+                $"anchor event {index}",
+                Utc("2030-01-01T10:00:00Z").AddMinutes(index)))
+            .ToList();
+        MinecraftWorkspaceTimeline timeline = Timeline(events);
+        MinecraftWorkspaceReadOnlyViewSnapshot before = ViewSnapshot(new MinecraftWorkspaceTimelineFilter().Evaluate(
+            timeline.GetOrderedSnapshot(),
+            new MinecraftWorkspaceTimelineFilterQuery()));
+        using var form = CreateForm();
+        using var control = new MinecraftWorkspaceReadOnlyControl(before);
+        form.Controls.Add(control);
+        form.Show();
+        Application.DoEvents();
+        control.FollowCheckBox.Checked = false;
+        control.EventGrid.FirstDisplayedScrollingRowIndex = 8;
+        Application.DoEvents();
+        int firstDisplayed = control.EventGrid.FirstDisplayedScrollingRowIndex;
+        long anchorIdentity = control.Snapshot.Rows[firstDisplayed].Identity;
+        int selectionIndex = Math.Min(firstDisplayed + 3, control.Snapshot.Rows.Count - 1);
+        SelectRow(control, selectionIndex);
+        long selectedIdentity = control.SelectedIdentity!.Value;
+        control.EventGrid.HorizontalScrollingOffset = 160;
+        int horizontalOffset = control.EventGrid.HorizontalScrollingOffset;
+
+        MinecraftWorkspaceIngressEvent late = CreateIngress(
+            100,
+            "late-anchor-file",
+            1,
+            "late anchor insertion",
+            Utc("2030-01-01T09:00:00Z"),
+            sourceId: "late-anchor-source");
+        events.Add(late);
+        timeline.AppendBatch([late]);
+        MinecraftWorkspaceReadOnlyViewSnapshot after = ViewSnapshot(new MinecraftWorkspaceTimelineFilter().Evaluate(
+            timeline.GetOrderedSnapshot(),
+            new MinecraftWorkspaceTimelineFilterQuery()));
+        int expectedAnchorRow = after.Rows.ToList().FindIndex(row => row.Identity == anchorIdentity);
+
+        control.ApplySnapshot(after);
+        Application.DoEvents();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(control.IsFollowEnabled, Is.False);
+            Assert.That(control.Snapshot.Rows[control.EventGrid.FirstDisplayedScrollingRowIndex].Identity, Is.EqualTo(anchorIdentity));
+            Assert.That(control.EventGrid.FirstDisplayedScrollingRowIndex, Is.EqualTo(expectedAnchorRow));
+            Assert.That(control.SelectedIdentity, Is.EqualTo(selectedIdentity), "Selection identity is independent from the viewport anchor.");
+            Assert.That(control.SelectedDetails!.EventRef, Is.SameAs(after.Rows.Single(row => row.Identity == selectedIdentity).Details.EventRef));
+            Assert.That(control.EventGrid.HorizontalScrollingOffset, Is.EqualTo(horizontalOffset));
+        });
+
+        MinecraftWorkspaceIngressEvent[] fallbackEvents = Enumerable.Range(101, 8)
+            .Select(index => CreateIngress(
+                index,
+                "fallback-file",
+                index,
+                $"fallback row {index}",
+                Utc("2030-01-01T13:00:00Z").AddMinutes(index)))
+            .ToArray();
+        events.AddRange(fallbackEvents);
+        timeline.AppendBatch(fallbackEvents);
+        MinecraftWorkspaceReadOnlyViewSnapshot filtered = ViewSnapshot(new MinecraftWorkspaceTimelineFilter().Evaluate(
+            timeline.GetOrderedSnapshot(),
+            new MinecraftWorkspaceTimelineFilterQuery(searchText: "fallback")));
+        control.ApplySnapshot(filtered);
+        Application.DoEvents();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(control.EventGrid.RowCount, Is.EqualTo(fallbackEvents.Length));
+            Assert.That(control.EventGrid.FirstDisplayedScrollingRowIndex, Is.EqualTo(0), "A filtered-out anchor falls back to a valid clamped prior index.");
+            Assert.That(control.IsFollowEnabled, Is.False);
+            Assert.That(control.SelectedIdentity, Is.Null);
+            Assert.That(control.SelectedDetails, Is.Null);
+        });
+    }
+
+    [Test]
     public void Control_clears_selection_and_details_when_identity_disappears_from_filtered_view ()
     {
         MinecraftWorkspaceReadOnlyViewSnapshot all = ViewSnapshot(
@@ -1032,6 +1188,9 @@ public sealed class MinecraftWorkspaceReadOnlyViewTests
         control.EventGrid.Rows[rowIndex].Selected = true;
         Application.DoEvents();
     }
+
+    private static bool IsAtTail (DataGridView grid) => grid.RowCount == 0 ||
+        grid.FirstDisplayedScrollingRowIndex + grid.DisplayedRowCount(includePartialRow: false) >= grid.RowCount;
 
     private static void AssertBucketsPreserved<TValue> (
         IReadOnlyList<MinecraftWorkspaceFacetDisplayItem<TValue>> displayItems,
