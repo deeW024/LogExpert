@@ -20,6 +20,7 @@ public static class MinecraftWorkspaceReadOnlyViewPresenter
 
         return new MinecraftWorkspaceReadOnlyViewSnapshot(
             workspaceDisplayName,
+            filterResult.QuerySnapshot,
             filterResult.Status,
             filterResult.TotalLoadedCount,
             filterResult.MatchedCount,
@@ -44,8 +45,9 @@ public static class MinecraftWorkspaceReadOnlyViewPresenter
         return Array.AsReadOnly(items);
     }
 
-    private static string DisplayStringFacet (MinecraftWorkspaceFacetValue<string> value) =>
-        value.IsUnknown ? "Unknown" : value.Value;
+    private static string DisplayStringFacet (MinecraftWorkspaceFacetValue<string> value) => value.IsUnknown
+        ? "Unknown"
+        : value.Value == "Unknown" ? "\"Unknown\" (literal)" : value.Value;
 
     private static string DisplayLevelFacet (MinecraftWorkspaceFacetValue<LogLevel> value) =>
         value.IsUnknown ? "Unknown" : MinecraftWorkspaceReadOnlyDisplay.Level(value.Value);
@@ -55,6 +57,7 @@ public sealed class MinecraftWorkspaceReadOnlyViewSnapshot
 {
     internal MinecraftWorkspaceReadOnlyViewSnapshot (
         string workspaceDisplayName,
+        MinecraftWorkspaceTimelineFilterQuery querySnapshot,
         MinecraftWorkspaceFilterStatus filterStatus,
         int totalLoadedCount,
         int? matchedCount,
@@ -63,6 +66,7 @@ public sealed class MinecraftWorkspaceReadOnlyViewSnapshot
         MinecraftWorkspaceReadOnlyFacetSnapshot facets)
     {
         WorkspaceDisplayName = workspaceDisplayName;
+        QuerySnapshot = querySnapshot;
         FilterStatus = filterStatus;
         TotalLoadedCount = totalLoadedCount;
         MatchedCount = matchedCount;
@@ -72,6 +76,9 @@ public sealed class MinecraftWorkspaceReadOnlyViewSnapshot
     }
 
     public string WorkspaceDisplayName { get; }
+
+    /// <summary>The exact immutable query used to produce this snapshot.</summary>
+    public MinecraftWorkspaceTimelineFilterQuery QuerySnapshot { get; }
 
     public MinecraftWorkspaceFilterStatus FilterStatus { get; }
 
