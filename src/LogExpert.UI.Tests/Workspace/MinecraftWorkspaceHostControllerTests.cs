@@ -236,6 +236,183 @@ public sealed class MinecraftWorkspaceHostControllerTests
     }
 
     [Test]
+    public void Pause_keeps_only_latest_snapshot_counts_matching_unseen_identities_and_resumes_once ()
+    {
+        List<MinecraftWorkspaceIngressEvent> events = [
+            CreateHostIngress("pause-file", 1, "match initial"),
+            CreateHostIngress("pause-file", 2, "skip initial")];
+        FakeRuntime runtime = new("pause", _ => Snapshot("pause"))
+        {
+            QuerySnapshotFactory = (call, query) => Snapshot($"cycle-{call}", events.ToArray(), query)
+        };
+        FakeRuntimeFactory runtimeFactory = new() { CreateRuntime = _ => runtime };
+        _host = CreateHost(runtimeFactory, new FakePicker(null));
+        OpenAndDrainInitialRefresh(_host, "pause-root");
+        MinecraftWorkspaceReadOnlyControl control = _host.Controller.ActiveDocument!.WorkspaceControl;
+        control.SearchTextBox.Text = "match";
+        _host.Dispatcher.DrainBackgroundAndUi();
+        int refreshesBeforePause = runtime.RefreshCount;
+
+        MinecraftWorkspaceReadOnlyViewSnapshot visibleSnapshot = control.Snapshot;
+        long selectedIdentity = visibleSnapshot.Rows.Single().Identity;
+        control.EventGrid.CurrentCell = control.EventGrid.Rows[0].Cells[0];
+        control.EventGrid.Rows[0].Selected = true;
+        Application.DoEvents();
+        control.PauseButton.PerformClick();
+
+        events.Add(CreateHostIngress("pause-file", 3, "match append one"));
+        events.Add(CreateHostIngress("pause-file", 4, "skip append one"));
+        _host.TriggerFactory.Triggers.Single().Raise();
+        _host.Dispatcher.RunNextBackground();
+        _host.Dispatcher.DrainUi();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(control.IsPaused, Is.True);
+            Assert.That(control.Snapshot, Is.SameAs(visibleSnapshot));
+            Assert.That(control.BacklogCount, Is.EqualTo(1));
+            Assert.That(control.LiveStateLabel.Text, Does.Contain("1"));
+            Assert.That(runtime.RefreshCount, Is.EqualTo(refreshesBeforePause + 1));
+        });
+
+        events.Add(CreateHostIngress("pause-file", 5, "match append two"));
+        _host.TriggerFactory.Triggers.Single().Raise();
+        _host.Dispatcher.RunNextBackground();
+        _host.Dispatcher.DrainUi();
+        MinecraftWorkspaceReadOnlyViewSnapshot latestPending = Snapshot("expected-latest", events.ToArray(), control.Snapshot.QuerySnapshot);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(control.Snapshot, Is.SameAs(visibleSnapshot));
+            Assert.That(control.BacklogCount, Is.EqualTo(2), "Backlog is the count of new matching identities, not row-count arithmetic.");
+            Assert.That(control.SelectedIdentity, Is.EqualTo(selectedIdentity));
+            Assert.That(control.IsFollowEnabled, Is.True, "Pause must not turn Follow off.");
+            Assert.That(runtime.RefreshCount, Is.EqualTo(refreshesBeforePause + 2));
+        });
+
+        control.PauseButton.PerformClick();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(control.IsPaused, Is.False);
+            Assert.That(control.BacklogCount, Is.Zero);
+            Assert.That(control.Snapshot.Rows.Select(row => row.Identity), Is.EqualTo(new long[] { 1, 3, 5 }));
+            Assert.That(control.SelectedIdentity, Is.EqualTo(selectedIdentity));
+            Assert.That(control.Snapshot.Rows.Any(row => row.Identity == 4), Is.False);
+            Assert.That(runtimeFactory.CreateCount, Is.EqualTo(1), "Resume must not recreate the runtime or readers.");
+            Assert.That(runtime.RefreshCount, Is.EqualTo(refreshesBeforePause + 2), "Applying pending state must not invoke a second refresh synchronously.");
+            Assert.That(_host.Dispatcher.PendingBackground, Is.EqualTo(1), "Resume schedules a catch-up refresh.");
+        });
+
+        _host.Dispatcher.RunNextBackground();
+        _host.Dispatcher.DrainUi();
+        Assert.That(control.Snapshot.Rows.Select(row => row.Identity), Is.EqualTo(latestPending.Rows.Select(row => row.Identity)));
+        Assert.That(runtime.RefreshCount, Is.EqualTo(refreshesBeforePause + 3), "The queued catch-up refresh runs after Resume.");
+    }
+
+    [Test]
+    public void Real_periodic_trigger_refreshes_and_updates_backlog_while_paused ()
+    {
+        List<MinecraftWorkspaceIngressEvent> events = [
+            CreateHostIngress("pause-timer-file", 1, "match initial"),
+            CreateHostIngress("pause-timer-file", 2, "skip initial")];
+        object eventsGate = new();
+        FakeRuntime runtime = new("pause-timer", _ => Snapshot("pause-timer"))
+        {
+            QuerySnapshotFactory = (call, query) =>
+            {
+                lock (eventsGate)
+                {
+                    return Snapshot($"pause-timer-{call}", events.ToArray(), query);
+                }
+            }
+        };
+        _host = CreateHost(
+            new FakeRuntimeFactory { CreateRuntime = _ => runtime },
+            new FakePicker(null),
+            static () => new WinFormsMinecraftWorkspaceRefreshTrigger());
+        OpenAndDrainInitialRefresh(_host, "pause-timer-root");
+        MinecraftWorkspaceReadOnlyControl control = _host.Controller.ActiveDocument!.WorkspaceControl;
+        control.SearchTextBox.Text = "match";
+        PumpUntil(_host, () => control.Snapshot.QuerySnapshot.SearchText == "match");
+        control.PauseButton.PerformClick();
+        MinecraftWorkspaceReadOnlyViewSnapshot visibleSnapshot = control.Snapshot;
+        int refreshesBeforeAppend = runtime.RefreshCount;
+
+        lock (eventsGate)
+        {
+            events.Add(CreateHostIngress("pause-timer-file", 3, "match appended"));
+            events.Add(CreateHostIngress("pause-timer-file", 4, "skip appended"));
+        }
+
+        PumpUntil(_host, () => control.BacklogCount == 1);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(runtime.RefreshCount, Is.GreaterThan(refreshesBeforeAppend), "The periodic trigger continues refreshing while paused.");
+            Assert.That(control.IsPaused, Is.True);
+            Assert.That(control.Snapshot, Is.SameAs(visibleSnapshot), "The visible snapshot remains frozen.");
+            Assert.That(control.BacklogCount, Is.EqualTo(1), "Only the unseen matching identity contributes to backlog.");
+        });
+    }
+
+    [Test]
+    public void Paused_query_revision_applies_once_discards_stale_results_and_keeps_only_latest_query ()
+    {
+        List<MinecraftWorkspaceIngressEvent> events = [
+            CreateHostIngress("query-pause-file", 1, "alpha event"),
+            CreateHostIngress("query-pause-file", 2, "beta event"),
+            CreateHostIngress("query-pause-file", 3, "gamma event")];
+        FakeRuntime runtime = new("paused-query", _ => Snapshot("paused-query"))
+        {
+            QuerySnapshotFactory = (call, query) => Snapshot($"cycle-{call}", events.ToArray(), query)
+        };
+        _host = CreateHost(new FakeRuntimeFactory { CreateRuntime = _ => runtime }, new FakePicker(null));
+        OpenAndDrainInitialRefresh(_host, "paused-query-root");
+        MinecraftWorkspaceReadOnlyControl control = _host.Controller.ActiveDocument!.WorkspaceControl;
+        control.PauseButton.PerformClick();
+
+        control.SearchTextBox.Text = "alpha";
+        _host.Dispatcher.RunNextBackground();
+        control.SearchTextBox.Text = "beta";
+        control.SearchTextBox.Text = "gamma";
+        _host.Dispatcher.RunNextUi();
+        Assert.That(control.Snapshot.QuerySnapshot.SearchText, Is.Null, "The queued alpha result belongs to a stale revision.");
+
+        _host.Dispatcher.RunNextBackground();
+        _host.Dispatcher.RunNextUi();
+        MinecraftWorkspaceReadOnlyViewSnapshot appliedQueryBaseline = control.Snapshot;
+        Assert.Multiple(() =>
+        {
+            Assert.That(control.IsPaused, Is.True);
+            Assert.That(control.BacklogCount, Is.Zero);
+            Assert.That(appliedQueryBaseline.QuerySnapshot.SearchText, Is.EqualTo("gamma"));
+            Assert.That(appliedQueryBaseline.Rows.Select(row => row.Entry.IngressEvent.Event.Message), Is.EqualTo(new[] { "gamma event" }));
+            Assert.That(runtime.RefreshQueries[^1].SearchText, Is.EqualTo("gamma"));
+        });
+
+        events.Add(CreateHostIngress("query-pause-file", 4, "gamma later"));
+        _host.TriggerFactory.Triggers.Single().Raise();
+        _host.Dispatcher.RunNextBackground();
+        _host.Dispatcher.RunNextUi();
+        Assert.Multiple(() =>
+        {
+            Assert.That(control.Snapshot, Is.SameAs(appliedQueryBaseline), "A same-revision live result is withheld after the one allowed paused query apply.");
+            Assert.That(control.BacklogCount, Is.EqualTo(1));
+            Assert.That(control.IsPaused, Is.True);
+        });
+
+        control.PauseButton.PerformClick();
+        Assert.Multiple(() =>
+        {
+            Assert.That(control.IsPaused, Is.False);
+            Assert.That(control.Snapshot.Rows.Select(row => row.Entry.IngressEvent.Event.Message), Is.EqualTo(new[] { "gamma event", "gamma later" }));
+            Assert.That(control.BacklogCount, Is.Zero);
+            Assert.That(runtime.RefreshQueries.Any(query => query.SearchText == "beta"), Is.False, "The coalesced rapid edit must run the latest query.");
+        });
+    }
+
+    [Test]
     public void Invalid_regex_and_timeout_states_reach_the_workspace_without_UI_exceptions ()
     {
         string timeoutText = new string('a', 50_000) + "!";
@@ -304,6 +481,116 @@ public sealed class MinecraftWorkspaceHostControllerTests
     }
 
     [Test]
+    public void Real_coordinator_timeline_filter_and_workspace_session_keep_pause_backlog_and_follow_anchor_canonical ()
+    {
+        string latestContents = string.Join(
+            Environment.NewLine,
+            Enumerable.Range(1, 20).Select(index => $"[18:41:{index:00}] [Render thread/INFO] synthetic latest {index}")) + Environment.NewLine;
+        string latestPath = CreateFile("logs/latest.log", latestContents);
+        DateTimeOffset firstYeezusTimestamp = Utc("2099-01-01T10:00:00Z");
+        StringBuilder yeezusContents = new();
+        for (int index = 1; index <= 25; index++)
+        {
+            string timestamp = firstYeezusTimestamp.AddMinutes(index).ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture);
+            yeezusContents.Append(timestamp).Append(" [INFO] [yeezus-core] [Client thread] synthetic initial ").Append(index).AppendLine();
+        }
+
+        yeezusContents.Append(firstYeezusTimestamp.AddMinutes(26).ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture))
+            .AppendLine(" [INFO] [yeezus-core] [Client thread] outside query framing boundary");
+        string yeezusPath = CreateFile("logs/yeezus.log", yeezusContents.ToString());
+        TrackingWorkspaceRuntimeFactory runtimeFactory = new(
+            new MinecraftWorkspaceHostRuntimeFactory(PluginRegistry.PluginRegistry.Instance, 2048));
+        _host = CreateHost(runtimeFactory, new FakePicker(_testDirectory));
+
+        OpenAndDrainInitialRefresh(_host, _testDirectory);
+        MinecraftWorkspaceReadOnlyControl control = _host.Controller.ActiveDocument!.WorkspaceControl;
+        PumpUntil(_host, () => control.Snapshot.Rows.Count >= 45);
+        control.SearchTextBox.Text = "synthetic";
+        control.TextScopeComboBox.SelectedIndex = (int)MinecraftWorkspaceTextScope.MessageOrRawText;
+        PumpUntil(_host, () => control.Snapshot.QuerySnapshot.SearchText == "synthetic" && control.Snapshot.Rows.Count >= 45);
+        MinecraftWorkspaceReadOnlyRow initialSelected = control.Snapshot.Rows.Single(row =>
+            row.Message.Contains("synthetic initial 10", StringComparison.Ordinal));
+        int selectedRow = control.Snapshot.Rows.ToList().FindIndex(row => row.Identity == initialSelected.Identity);
+        control.EventGrid.CurrentCell = control.EventGrid.Rows[selectedRow].Cells[0];
+        control.EventGrid.Rows[selectedRow].Selected = true;
+        Application.DoEvents();
+        control.FollowCheckBox.Checked = true;
+        Application.DoEvents();
+        long selectedIdentity = initialSelected.Identity;
+        EventRef selectedEventRef = initialSelected.Details.EventRef;
+        FileRef selectedFileRef = initialSelected.Details.FileRef;
+        MinecraftWorkspaceReadOnlyViewSnapshot visibleBeforePause = control.Snapshot;
+        control.PauseButton.PerformClick();
+
+        string newYeezusRecords = firstYeezusTimestamp.AddMinutes(40).ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture) +
+            " [INFO] [yeezus-core] [Client thread] synthetic pause-match appended\n" +
+            firstYeezusTimestamp.AddMinutes(41).ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture) +
+            " [INFO] [yeezus-core] [Client thread] outside query framing boundary\n";
+        File.AppendAllText(yeezusPath, newYeezusRecords, new UTF8Encoding(false));
+        File.AppendAllText(latestPath, "[18:42:00] [Render thread/INFO] nonmatching live noise" + Environment.NewLine, new UTF8Encoding(false));
+        long lateTimestamp = firstYeezusTimestamp.AddMinutes(1).ToUnixTimeMilliseconds();
+        _ = CreateFile(
+            "cactusmonitor/sessions/cfm-synthetic-pause-late.jsonl",
+            $"{{\"type\":\"CYCLE\",\"sessionId\":\"synthetic-pause-late\",\"sequence\":1,\"timestampEpochMillis\":{lateTimestamp}}}" + Environment.NewLine);
+
+        PumpUntil(_host, () => control.BacklogCount == 2);
+        Assert.Multiple(() =>
+        {
+            Assert.That(control.IsPaused, Is.True);
+            Assert.That(control.Snapshot, Is.SameAs(visibleBeforePause), "The visible grid snapshot stays frozen while the real runtime refreshes.");
+            Assert.That(control.Snapshot.Rows.Select(row => row.Identity), Does.Contain(selectedIdentity));
+            Assert.That(control.BacklogCount, Is.EqualTo(2), "The nonmatching live append is excluded from the active-query backlog.");
+            Assert.That(control.LiveStateLabel.Text, Does.Contain("2"));
+            Assert.That(control.Snapshot.QuerySnapshot.SearchText, Is.EqualTo("synthetic"));
+        });
+
+        control.PauseButton.PerformClick();
+        Application.DoEvents();
+        MinecraftWorkspaceReadOnlyRow[] resumedRows = control.Snapshot.Rows.ToArray();
+        MinecraftWorkspaceReadOnlyRow lateRow = resumedRows.Single(row => row.Details.RawText.Contains("synthetic-pause-late", StringComparison.Ordinal));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(control.IsPaused, Is.False);
+            Assert.That(control.BacklogCount, Is.Zero);
+            Assert.That(resumedRows, Has.Length.EqualTo(47));
+            Assert.That(lateRow.IsLate, Is.True);
+            Assert.That(Array.FindIndex(resumedRows, row => row.Identity == lateRow.Identity), Is.LessThan(Array.FindIndex(resumedRows, row => row.Identity == selectedIdentity)));
+            Assert.That(control.SelectedIdentity, Is.EqualTo(selectedIdentity));
+            Assert.That(control.SelectedDetails!.EventRef, Is.SameAs(selectedEventRef));
+            Assert.That(control.SelectedDetails.FileRef, Is.SameAs(selectedFileRef));
+            Assert.That(control.Snapshot.Rows.Select(row => row.Identity).Distinct().Count(), Is.EqualTo(control.Snapshot.Rows.Count));
+            Assert.That(control.IsFollowEnabled, Is.True);
+            Assert.That(IsAtTail(control.EventGrid), Is.True);
+            Assert.That(control.Snapshot.QuerySnapshot.SearchText, Is.EqualTo("synthetic"));
+        });
+
+        control.FollowCheckBox.Checked = false;
+        control.EventGrid.FirstDisplayedScrollingRowIndex = 10;
+        Application.DoEvents();
+        long anchorIdentity = control.Snapshot.Rows[control.EventGrid.FirstDisplayedScrollingRowIndex].Identity;
+        control.PauseButton.PerformClick();
+        long secondLateTimestamp = firstYeezusTimestamp.AddSeconds(30).ToUnixTimeMilliseconds();
+        _ = CreateFile(
+            "cactusmonitor/sessions/cfm-synthetic-pause-late-earlier.jsonl",
+            $"{{\"type\":\"CYCLE\",\"sessionId\":\"synthetic-pause-earlier\",\"sequence\":1,\"timestampEpochMillis\":{secondLateTimestamp}}}" + Environment.NewLine);
+        PumpUntil(_host, () => control.BacklogCount == 1);
+        control.PauseButton.PerformClick();
+        Application.DoEvents();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(control.IsFollowEnabled, Is.False);
+            Assert.That(control.Snapshot.Rows[control.EventGrid.FirstDisplayedScrollingRowIndex].Identity, Is.EqualTo(anchorIdentity));
+            Assert.That(control.SelectedIdentity, Is.EqualTo(selectedIdentity));
+            Assert.That(control.Snapshot.Rows.Any(row => row.Details.RawText.Contains("synthetic-pause-earlier", StringComparison.Ordinal)), Is.True);
+            Assert.That(control.Snapshot.QuerySnapshot.SearchText, Is.EqualTo("synthetic"));
+            Assert.That(runtimeFactory.CreatedRuntimes, Has.Count.EqualTo(1), "Pause and Resume retain the original live runtime.");
+            Assert.That(_host.Errors, Is.Empty);
+        });
+    }
+
+    [Test]
     public void Queued_snapshot_is_ignored_after_replacement_or_document_close ()
     {
         FakeRuntimeFactory runtimeFactory = new();
@@ -338,15 +625,67 @@ public sealed class MinecraftWorkspaceHostControllerTests
     }
 
     [Test]
+    public void Paused_pending_snapshot_is_discarded_when_its_workspace_session_is_replaced ()
+    {
+        FakeRuntime oldRuntime = new("old", call => Snapshot(call <= 2 ? "old-initial" : "old-pending"));
+        FakeRuntime newRuntime = new("new", _ => Snapshot("new-initial"));
+        FakeRuntimeFactory runtimeFactory = new()
+        {
+            CreateRuntime = path => path == "old" ? oldRuntime : newRuntime
+        };
+        _host = CreateHost(runtimeFactory, new FakePicker(null));
+        OpenAndDrainInitialRefresh(_host, "old");
+        MinecraftWorkspaceReadOnlyDocument oldDocument = _host.Controller.ActiveDocument!;
+        MinecraftWorkspaceReadOnlyControl oldControl = oldDocument.WorkspaceControl;
+        MinecraftWorkspaceReadOnlyViewSnapshot visibleSnapshot = oldControl.Snapshot;
+        oldControl.PauseButton.PerformClick();
+        _host.TriggerFactory.Triggers[0].Raise();
+        _host.Dispatcher.RunNextBackground();
+        _host.Dispatcher.RunNextUi();
+        Assert.Multiple(() =>
+        {
+            Assert.That(oldControl.IsPaused, Is.True);
+            Assert.That(oldRuntime.RefreshCount, Is.GreaterThan(2), "The runtime refreshes while presentation is paused.");
+            Assert.That(oldControl.Snapshot, Is.SameAs(visibleSnapshot));
+        });
+
+        Task<bool> replacement = _host.Controller.OpenWorkspaceAsync("new");
+        _host.Dispatcher.RunNextBackground();
+        _host.Dispatcher.RunNextUi();
+        Assert.That(replacement.GetAwaiter().GetResult(), Is.True);
+        _host.Dispatcher.DrainBackgroundAndUi();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(oldDocument.IsDisposed, Is.True);
+            Assert.That(oldControl.Snapshot, Is.SameAs(visibleSnapshot));
+            Assert.That(_host.Controller.ActiveDocument!.WorkspaceControl.Snapshot.WorkspaceDisplayName, Is.EqualTo("new-initial"));
+            Assert.That(oldRuntime.DisposeCount, Is.EqualTo(1));
+            Assert.That(newRuntime.DisposeCount, Is.Zero);
+            Assert.That(_host.Errors, Is.Empty);
+        });
+    }
+
+    [Test]
     public void Closing_document_and_host_stops_trigger_and_disposes_runtime_idempotently ()
     {
         FakeRuntimeFactory runtimeFactory = new();
-        FakeRuntime runtime = new("workspace", _ => Snapshot("workspace"));
+        FakeRuntime runtime = new("workspace", call => Snapshot(call <= 2 ? "workspace-initial" : "workspace-pending"));
         runtimeFactory.CreateRuntime = _ => runtime;
         _host = CreateHost(runtimeFactory, new FakePicker(null));
         OpenAndDrainInitialRefresh(_host, "root");
         MinecraftWorkspaceReadOnlyDocument document = _host.Controller.ActiveDocument!;
+        MinecraftWorkspaceReadOnlyViewSnapshot visibleSnapshot = document.WorkspaceControl.Snapshot;
         ManualRefreshTrigger trigger = _host.TriggerFactory.Triggers.Single();
+        document.WorkspaceControl.PauseButton.PerformClick();
+        trigger.Raise();
+        _host.Dispatcher.RunNextBackground();
+        _host.Dispatcher.RunNextUi();
+        Assert.Multiple(() =>
+        {
+            Assert.That(document.WorkspaceControl.IsPaused, Is.True);
+            Assert.That(document.WorkspaceControl.Snapshot, Is.SameAs(visibleSnapshot));
+        });
 
         document.Close();
         trigger.Raise();
@@ -360,6 +699,7 @@ public sealed class MinecraftWorkspaceHostControllerTests
             Assert.That(trigger.StopCount, Is.GreaterThanOrEqualTo(1));
             Assert.That(trigger.DisposeCount, Is.EqualTo(1));
             Assert.That(runtime.DisposeCount, Is.EqualTo(1));
+            Assert.That(document.WorkspaceControl.Snapshot, Is.SameAs(visibleSnapshot));
             Assert.That(_host.Dispatcher.PendingBackground, Is.Zero);
         });
     }
@@ -659,7 +999,8 @@ public sealed class MinecraftWorkspaceHostControllerTests
 
     private TestHost CreateHost (
         IMinecraftWorkspaceHostRuntimeFactory runtimeFactory,
-        FakePicker picker)
+        FakePicker picker,
+        Func<IMinecraftWorkspaceRefreshTrigger>? refreshTriggerFactory = null)
     {
         Form form = new()
         {
@@ -677,6 +1018,7 @@ public sealed class MinecraftWorkspaceHostControllerTests
         form.Show();
         Application.DoEvents();
         ManualRefreshTriggerFactory triggerFactory = new();
+        refreshTriggerFactory ??= triggerFactory.Create;
         QueuedHostDispatcher dispatcher = new();
         List<Exception> errors = [];
         MinecraftWorkspaceHostController controller = new(
@@ -684,7 +1026,7 @@ public sealed class MinecraftWorkspaceHostControllerTests
             dockPanel,
             picker,
             runtimeFactory,
-            triggerFactory.Create,
+            refreshTriggerFactory,
             dispatcher,
             errors.Add);
         return _host = new TestHost(form, dockPanel, controller, dispatcher, triggerFactory, errors);
@@ -736,8 +1078,14 @@ public sealed class MinecraftWorkspaceHostControllerTests
         Assert.That(condition(), Is.True,
             $"The real reader/session path did not publish the expected synthetic log event. Rows={host.Controller.ActiveDocument?.WorkspaceControl.Snapshot.Rows.Count}, " +
             $"Loaded={host.Controller.ActiveDocument?.WorkspaceControl.Snapshot.TotalLoadedCount}, " +
-            $"Query={host.Controller.ActiveDocument?.WorkspaceControl.Snapshot.QuerySnapshot.SearchText}");
+            $"Query={host.Controller.ActiveDocument?.WorkspaceControl.Snapshot.QuerySnapshot.SearchText}, " +
+            $"Scope={host.Controller.ActiveDocument?.WorkspaceControl.Snapshot.QuerySnapshot.TextScope}, " +
+            $"Live={host.Controller.ActiveDocument?.WorkspaceControl.LiveStateLabel.Text}, " +
+            $"VisibleRows={host.Controller.ActiveDocument?.WorkspaceControl.Snapshot.Rows.Count}");
     }
+
+    private static bool IsAtTail (DataGridView grid) => grid.RowCount == 0 ||
+        grid.FirstDisplayedScrollingRowIndex + grid.DisplayedRowCount(includePartialRow: false) >= grid.RowCount;
 
     private string CreateFile (string relativePath, string contents)
     {
@@ -756,6 +1104,19 @@ public sealed class MinecraftWorkspaceHostControllerTests
         MinecraftWorkspaceTimelineFilterResult result = new MinecraftWorkspaceTimelineFilter().Evaluate(
             timeline.GetOrderedSnapshot(),
             new MinecraftWorkspaceTimelineFilterQuery());
+        return MinecraftWorkspaceReadOnlyViewPresenter.CreateSnapshot(displayName, result);
+    }
+
+    private static MinecraftWorkspaceReadOnlyViewSnapshot Snapshot (
+        string displayName,
+        IReadOnlyList<MinecraftWorkspaceIngressEvent> events,
+        MinecraftWorkspaceTimelineFilterQuery query)
+    {
+        MinecraftWorkspaceTimeline timeline = new("host-query-workspace");
+        timeline.AppendBatch(events);
+        MinecraftWorkspaceTimelineFilterResult result = new MinecraftWorkspaceTimelineFilter().Evaluate(
+            timeline.GetOrderedSnapshot(),
+            query);
         return MinecraftWorkspaceReadOnlyViewPresenter.CreateSnapshot(displayName, result);
     }
 

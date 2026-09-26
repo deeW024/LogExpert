@@ -69,26 +69,25 @@ internal sealed class FolderBrowserMinecraftWorkspacePicker : IMinecraftWorkspac
 internal sealed class WinFormsMinecraftWorkspaceRefreshTrigger : IMinecraftWorkspaceRefreshTrigger
 {
     /// <summary>Triggers a coalesced workspace refresh every second.</summary>
-    private readonly System.Windows.Forms.Timer _timer = new() { Interval = 1000 };
+    private readonly System.Threading.Timer _timer;
 
     public WinFormsMinecraftWorkspaceRefreshTrigger ()
     {
-        _timer.Tick += OnTimerTick;
+        _timer = new System.Threading.Timer(OnTimerTick, null, Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
     }
 
     public event EventHandler? Tick;
 
-    public void Start () => _timer.Start();
+    public void Start () => _ = _timer.Change(TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
 
-    public void StopTrigger () => _timer.Stop();
+    public void StopTrigger () => _ = _timer.Change(Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
 
     public void Dispose ()
     {
-        _timer.Tick -= OnTimerTick;
         _timer.Dispose();
     }
 
-    private void OnTimerTick (object? sender, EventArgs e) => Tick?.Invoke(this, e);
+    private void OnTimerTick (object? state) => Tick?.Invoke(this, EventArgs.Empty);
 }
 
 [SupportedOSPlatform("windows")]
@@ -456,8 +455,12 @@ internal sealed class MinecraftWorkspaceHostSession : IDisposable
     private readonly object _gate = new();
     private bool _refreshRunning;
     private bool _refreshPending;
+    private bool _paused;
     private MinecraftWorkspaceTimelineFilterQuery _currentQuery;
     private long _queryRevision;
+    private MinecraftWorkspaceReadOnlyViewSnapshot? _pausedSnapshot;
+    private long _pausedSnapshotRevision;
+    private long? _allowPausedApplyRevision;
     private int _disposed;
 
     public MinecraftWorkspaceHostSession (
@@ -477,6 +480,7 @@ internal sealed class MinecraftWorkspaceHostSession : IDisposable
         _currentQuery = Document.WorkspaceControl.Snapshot.QuerySnapshot;
         Document.FormClosed += OnDocumentFormClosed;
         Document.WorkspaceControl.FilterQueryChanged += OnFilterQueryChanged;
+        Document.WorkspaceControl.PauseChanged += OnPauseChanged;
     }
 
     public MinecraftWorkspaceReadOnlyDocument Document { get; }
@@ -505,12 +509,16 @@ internal sealed class MinecraftWorkspaceHostSession : IDisposable
         lock (_gate)
         {
             _refreshPending = false;
+            _pausedSnapshot = null;
+            _pausedSnapshotRevision = 0;
+            _allowPausedApplyRevision = null;
         }
 
         _trigger.Tick -= OnTriggerTick;
         _trigger.StopTrigger();
         _trigger.Dispose();
         Document.WorkspaceControl.FilterQueryChanged -= OnFilterQueryChanged;
+        Document.WorkspaceControl.PauseChanged -= OnPauseChanged;
         Document.FormClosed -= OnDocumentFormClosed;
         try
         {
@@ -541,9 +549,62 @@ internal sealed class MinecraftWorkspaceHostSession : IDisposable
 
             _currentQuery = e.Query;
             _queryRevision = checked(_queryRevision + 1);
+            if (_paused)
+            {
+                _pausedSnapshot = null;
+                _pausedSnapshotRevision = 0;
+                _allowPausedApplyRevision = _queryRevision;
+            }
+        }
+
+        if (Document.WorkspaceControl.IsPaused)
+        {
+            Document.WorkspaceControl.SetPaused(isPaused: true, backlogCount: 0);
         }
 
         RequestRefresh();
+    }
+
+    private void OnPauseChanged (object? sender, EventArgs e)
+    {
+        bool isPaused = Document.WorkspaceControl.IsPaused;
+        MinecraftWorkspaceReadOnlyViewSnapshot? snapshotToApply = null;
+        lock (_gate)
+        {
+            if (Volatile.Read(ref _disposed) != 0)
+            {
+                return;
+            }
+
+            _paused = isPaused;
+            _allowPausedApplyRevision = null;
+            if (isPaused)
+            {
+                _pausedSnapshot = null;
+                _pausedSnapshotRevision = 0;
+            }
+            else
+            {
+                if (_pausedSnapshotRevision == _queryRevision)
+                {
+                    snapshotToApply = _pausedSnapshot;
+                }
+
+                _pausedSnapshot = null;
+                _pausedSnapshotRevision = 0;
+            }
+        }
+
+        Document.WorkspaceControl.SetPaused(isPaused, backlogCount: 0);
+        if (!isPaused)
+        {
+            if (snapshotToApply != null && _isCurrent(this) && !Document.IsDisposed && !Document.WorkspaceControl.IsDisposed)
+            {
+                Document.WorkspaceControl.ApplySnapshot(snapshotToApply);
+            }
+
+            RequestRefresh();
+        }
     }
 
     private void RequestRefresh ()
@@ -659,14 +720,62 @@ internal sealed class MinecraftWorkspaceHostSession : IDisposable
             return;
         }
 
+        bool applySnapshot = true;
+        int backlogCount = 0;
+        lock (_gate)
+        {
+            if (Volatile.Read(ref _disposed) != 0 || queryRevision != _queryRevision)
+            {
+                return;
+            }
+
+            if (_paused)
+            {
+                if (_allowPausedApplyRevision == queryRevision)
+                {
+                    _allowPausedApplyRevision = null;
+                    _pausedSnapshot = null;
+                    _pausedSnapshotRevision = 0;
+                }
+                else
+                {
+                    _pausedSnapshot = snapshot;
+                    _pausedSnapshotRevision = queryRevision;
+                    backlogCount = CountUnseenIdentities(snapshot, Document.WorkspaceControl.Snapshot);
+                    applySnapshot = false;
+                }
+            }
+        }
+
+        if (!applySnapshot)
+        {
+            Document.WorkspaceControl.SetPaused(isPaused: true, backlogCount);
+            return;
+        }
+
         try
         {
             Document.WorkspaceControl.ApplySnapshot(snapshot);
+            if (Document.WorkspaceControl.IsPaused)
+            {
+                Document.WorkspaceControl.SetPaused(isPaused: true, backlogCount: 0);
+            }
         }
         catch (Exception exception)
         {
             Logger.Error(exception, "Could not apply Minecraft workspace view snapshot.");
         }
+    }
+
+    private static int CountUnseenIdentities (
+        MinecraftWorkspaceReadOnlyViewSnapshot pendingSnapshot,
+        MinecraftWorkspaceReadOnlyViewSnapshot visibleSnapshot)
+    {
+        HashSet<long> visibleIdentities = visibleSnapshot.Rows.Select(row => row.Identity).ToHashSet();
+        return pendingSnapshot.Rows
+            .Select(row => row.Identity)
+            .Distinct()
+            .Count(identity => !visibleIdentities.Contains(identity));
     }
 
     private void OnDocumentFormClosed (object? sender, FormClosedEventArgs e)

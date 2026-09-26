@@ -2364,4 +2364,22 @@ LogExpert neu starten, um die Änderungen zu übernehmen?</value>
   <data name="MinecraftWorkspace_Filter_ClearAll" xml:space="preserve">
     <value>Alle Filter löschen</value>
   </data>
+  <data name="MinecraftWorkspace_Live_Follow" xml:space="preserve">
+    <value>Folgen</value>
+  </data>
+  <data name="MinecraftWorkspace_Live_Pause" xml:space="preserve">
+    <value>Anhalten</value>
+  </data>
+  <data name="MinecraftWorkspace_Live_Resume" xml:space="preserve">
+    <value>Fortsetzen</value>
+  </data>
+  <data name="MinecraftWorkspace_Live_Following" xml:space="preserve">
+    <value>Live · Folgen</value>
+  </data>
+  <data name="MinecraftWorkspace_Live_Anchored" xml:space="preserve">
+    <value>Live · Verankert</value>
+  </data>
+  <data name="MinecraftWorkspace_Live_Paused" xml:space="preserve">
+    <value>Angehalten · Rückstand: {0}</value>
+  </data>
 </root>

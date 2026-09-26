@@ -2374,4 +2374,10 @@ Restart LogExpert to apply changes?</value>
   <data name="MinecraftWorkspace_Filter_SearchIn" xml:space="preserve"><value>Search in</value></data>
   <data name="MinecraftWorkspace_Filter_Invert" xml:space="preserve"><value>Invert</value></data>
   <data name="MinecraftWorkspace_Filter_ClearAll" xml:space="preserve"><value>Clear all filters</value></data>
+  <data name="MinecraftWorkspace_Live_Follow" xml:space="preserve"><value>Follow</value></data>
+  <data name="MinecraftWorkspace_Live_Pause" xml:space="preserve"><value>Pause</value></data>
+  <data name="MinecraftWorkspace_Live_Resume" xml:space="preserve"><value>Resume</value></data>
+  <data name="MinecraftWorkspace_Live_Following" xml:space="preserve"><value>Live · Following</value></data>
+  <data name="MinecraftWorkspace_Live_Anchored" xml:space="preserve"><value>Live · Follow off</value></data>
+  <data name="MinecraftWorkspace_Live_Paused" xml:space="preserve"><value>Paused · Backlog: {0}</value></data>
 </root>

@@ -18,6 +18,9 @@ public sealed class MinecraftWorkspaceReadOnlyControl : UserControl
     private readonly CheckBox _caseSensitiveCheckBox;
     private readonly CheckBox _invertCheckBox;
     private readonly Button _clearFiltersButton;
+    private readonly CheckBox _followCheckBox;
+    private readonly Button _pauseButton;
+    private readonly Label _liveStateLabel;
     private readonly TabControl _facetTabs;
     private readonly CheckedListBox _fileFacetList;
     private readonly CheckedListBox _sourceFacetList;
@@ -34,6 +37,7 @@ public sealed class MinecraftWorkspaceReadOnlyControl : UserControl
     private IReadOnlyDictionary<long, int> _rowIndexByIdentity = new Dictionary<long, int>();
     private MinecraftWorkspaceReadOnlyViewSnapshot _snapshot;
     private bool _synchronizingEditor;
+    private bool _suppressFollowScrollTracking;
 
     public MinecraftWorkspaceReadOnlyControl (MinecraftWorkspaceReadOnlyViewSnapshot snapshot)
     {
@@ -86,6 +90,25 @@ public sealed class MinecraftWorkspaceReadOnlyControl : UserControl
             Text = Resources.ResourceManager.GetString("MinecraftWorkspace_Filter_ClearAll", CultureInfo.CurrentUICulture)!,
             AutoSize = true
         };
+        _followCheckBox = new CheckBox
+        {
+            Name = "WorkspaceFollow",
+            Text = Resources.ResourceManager.GetString("MinecraftWorkspace_Live_Follow", CultureInfo.CurrentUICulture)!,
+            AutoSize = true,
+            Checked = true
+        };
+        _pauseButton = new Button
+        {
+            Name = "WorkspacePause",
+            AutoSize = true
+        };
+        _liveStateLabel = new Label
+        {
+            Name = "WorkspaceLiveState",
+            AutoSize = true,
+            Margin = new Padding(4, 6, 1, 0)
+        };
+        UpdateLiveStateText();
 
         FlowLayoutPanel filterEditor = new()
         {
@@ -103,6 +126,9 @@ public sealed class MinecraftWorkspaceReadOnlyControl : UserControl
         filterEditor.Controls.Add(_caseSensitiveCheckBox);
         filterEditor.Controls.Add(_invertCheckBox);
         filterEditor.Controls.Add(_clearFiltersButton);
+        filterEditor.Controls.Add(_followCheckBox);
+        filterEditor.Controls.Add(_pauseButton);
+        filterEditor.Controls.Add(_liveStateLabel);
 
         _facetTabs = new TabControl { Name = "WorkspaceFacets", Dock = DockStyle.Fill };
         _fileFacetList = CreateFacetList("WorkspaceFileFacet");
@@ -165,7 +191,7 @@ public sealed class MinecraftWorkspaceReadOnlyControl : UserControl
             RowCount = 3
         };
         root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 58));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 84));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 56));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         root.Controls.Add(filterEditor, 0, 0);
@@ -179,6 +205,8 @@ public sealed class MinecraftWorkspaceReadOnlyControl : UserControl
         _caseSensitiveCheckBox.CheckedChanged += OnTextQueryChanged;
         _invertCheckBox.CheckedChanged += OnTextQueryChanged;
         _clearFiltersButton.Click += OnClearFilters;
+        _followCheckBox.CheckedChanged += OnFollowChanged;
+        _pauseButton.Click += OnPauseClicked;
         _fileFacetList.ItemCheck += (_, e) => OnFacetItemCheck(_fileFacetList, _selectedFileIds, e);
         _sourceFacetList.ItemCheck += (_, e) => OnFacetItemCheck(_sourceFacetList, _selectedSources, e);
         _componentFacetList.ItemCheck += (_, e) => OnFacetItemCheck(_componentFacetList, _selectedComponents, e);
@@ -189,6 +217,8 @@ public sealed class MinecraftWorkspaceReadOnlyControl : UserControl
     }
 
     public event EventHandler<MinecraftWorkspaceFilterQueryChangedEventArgs>? FilterQueryChanged;
+
+    public event EventHandler? PauseChanged;
 
     public MinecraftWorkspaceReadOnlyViewSnapshot Snapshot => _snapshot;
 
@@ -203,6 +233,18 @@ public sealed class MinecraftWorkspaceReadOnlyControl : UserControl
     public CheckBox InvertCheckBox => _invertCheckBox;
 
     public Button ClearFiltersButton => _clearFiltersButton;
+
+    public CheckBox FollowCheckBox => _followCheckBox;
+
+    public Button PauseButton => _pauseButton;
+
+    public Label LiveStateLabel => _liveStateLabel;
+
+    public bool IsFollowEnabled => _followCheckBox.Checked;
+
+    public bool IsPaused { get; private set; }
+
+    public int BacklogCount { get; private set; }
 
     public TabControl FacetTabs => _facetTabs;
 
@@ -235,6 +277,12 @@ public sealed class MinecraftWorkspaceReadOnlyControl : UserControl
         VerifyUiThread();
 
         long? previouslySelectedIdentity = SelectedIdentity;
+        int previousFirstDisplayedRow = _eventGrid.RowCount == 0 ? 0 : Math.Max(0, _eventGrid.FirstDisplayedScrollingRowIndex);
+        long? anchorIdentity = !IsFollowEnabled && previousFirstDisplayedRow < _snapshot.Rows.Count
+            ? _snapshot.Rows[previousFirstDisplayedRow].Identity
+            : null;
+        int horizontalOffset = _eventGrid.HorizontalScrollingOffset;
+        _suppressFollowScrollTracking = true;
         _synchronizingEditor = true;
         try
         {
@@ -261,10 +309,38 @@ public sealed class MinecraftWorkspaceReadOnlyControl : UserControl
                 _eventGrid.Rows[newRowIndex].Selected = true;
                 SelectIdentity(identity);
             }
+
+            if (IsFollowEnabled)
+            {
+                ScrollToTail();
+            }
+            else
+            {
+                int anchorRow = anchorIdentity is long priorIdentity && _rowIndexByIdentity.TryGetValue(priorIdentity, out int anchoredIndex)
+                    ? anchoredIndex
+                    : Math.Clamp(previousFirstDisplayedRow, 0, Math.Max(0, snapshot.Rows.Count - 1));
+                if (snapshot.Rows.Count > 0)
+                {
+                    _eventGrid.FirstDisplayedScrollingRowIndex = anchorRow;
+                }
+
+                if (horizontalOffset > 0)
+                {
+                    try
+                    {
+                        _eventGrid.HorizontalScrollingOffset = horizontalOffset;
+                    }
+                    catch (ArgumentOutOfRangeException)
+                    {
+                        // A resized grid may expose less horizontal range than the captured view.
+                    }
+                }
+            }
         }
         finally
         {
             _synchronizingEditor = false;
+            _suppressFollowScrollTracking = false;
         }
     }
 
@@ -317,7 +393,78 @@ public sealed class MinecraftWorkspaceReadOnlyControl : UserControl
 
         grid.CellValueNeeded += OnCellValueNeeded;
         grid.SelectionChanged += OnSelectionChanged;
+        grid.Scroll += OnGridScroll;
         return grid;
+    }
+
+    internal void SetPaused (bool isPaused, int backlogCount)
+    {
+        VerifyUiThread();
+        IsPaused = isPaused;
+        BacklogCount = Math.Max(0, backlogCount);
+        UpdateLiveStateText();
+    }
+
+    private void OnFollowChanged (object? sender, EventArgs e)
+    {
+        UpdateLiveStateText();
+        if (IsFollowEnabled && !IsPaused)
+        {
+            ScrollToTail();
+        }
+
+    }
+
+    private void OnPauseClicked (object? sender, EventArgs e)
+    {
+        SetPaused(!IsPaused, IsPaused ? 0 : BacklogCount);
+        PauseChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    private void OnGridScroll (object? sender, ScrollEventArgs e)
+    {
+        if (_suppressFollowScrollTracking || e.ScrollOrientation != ScrollOrientation.VerticalScroll || _eventGrid.RowCount == 0)
+        {
+            return;
+        }
+
+        int firstDisplayedRow = _eventGrid.FirstDisplayedScrollingRowIndex;
+        int displayedRows = _eventGrid.DisplayedRowCount(includePartialRow: false);
+        _followCheckBox.Checked = firstDisplayedRow + displayedRows >= _eventGrid.RowCount;
+    }
+
+    private void ScrollToTail ()
+    {
+        if (_eventGrid.RowCount == 0)
+        {
+            return;
+        }
+
+        bool wasSuppressingScrollTracking = _suppressFollowScrollTracking;
+        _suppressFollowScrollTracking = true;
+        try
+        {
+            _eventGrid.FirstDisplayedScrollingRowIndex = _eventGrid.RowCount - 1;
+        }
+        finally
+        {
+            _suppressFollowScrollTracking = wasSuppressingScrollTracking;
+        }
+    }
+
+    private void UpdateLiveStateText ()
+    {
+        _pauseButton.Text = Resources.ResourceManager.GetString(
+            IsPaused ? "MinecraftWorkspace_Live_Resume" : "MinecraftWorkspace_Live_Pause",
+            CultureInfo.CurrentUICulture)!;
+        _liveStateLabel.Text = IsPaused
+            ? string.Format(
+                CultureInfo.CurrentCulture,
+                Resources.ResourceManager.GetString("MinecraftWorkspace_Live_Paused", CultureInfo.CurrentUICulture)!,
+                BacklogCount)
+            : Resources.ResourceManager.GetString(
+                IsFollowEnabled ? "MinecraftWorkspace_Live_Following" : "MinecraftWorkspace_Live_Anchored",
+                CultureInfo.CurrentUICulture)!;
     }
 
     private static void AddColumn (DataGridView grid, string name, string header, int width)

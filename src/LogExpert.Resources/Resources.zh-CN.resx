@@ -2258,4 +2258,22 @@ YY[YY] = 年
   <data name="MinecraftWorkspace_Filter_ClearAll" xml:space="preserve">
     <value>清除所有筛选器</value>
   </data>
+  <data name="MinecraftWorkspace_Live_Follow" xml:space="preserve">
+    <value>跟随</value>
+  </data>
+  <data name="MinecraftWorkspace_Live_Pause" xml:space="preserve">
+    <value>暂停</value>
+  </data>
+  <data name="MinecraftWorkspace_Live_Resume" xml:space="preserve">
+    <value>继续</value>
+  </data>
+  <data name="MinecraftWorkspace_Live_Following" xml:space="preserve">
+    <value>实时 · 跟随</value>
+  </data>
+  <data name="MinecraftWorkspace_Live_Anchored" xml:space="preserve">
+    <value>实时 · 已固定</value>
+  </data>
+  <data name="MinecraftWorkspace_Live_Paused" xml:space="preserve">
+    <value>已暂停 · 待处理: {0}</value>
+  </data>
 </root>
