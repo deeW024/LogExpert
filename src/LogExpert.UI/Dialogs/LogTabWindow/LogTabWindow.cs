@@ -123,6 +123,17 @@ internal partial class LogTabWindow : Form, ILogTabWindow
 
         ConfigManager = configManager;
 
+        _toolWindowCoordinator = new ToolWindowCoordinator(configManager);
+
+        _ledService = new LedIndicatorService();
+        _ledService.Initialize(ConfigManager.Settings.Preferences.ShowTailColor);
+        _ledService.IconChanged += OnLedIconChanged;
+        _ledService.StartService();
+
+        _deadIcon = _ledService.GetDeadIcon();
+
+        _fileOperationService = new FileOperationService(configManager, _tabController, _ledService, PluginRegistry.PluginRegistry.Instance, CreateLogWindowFromRequest, () => Clipboard.ContainsText() ? Clipboard.GetText() : null, LoadSession);
+
         _minecraftWorkspaceHostController = new MinecraftWorkspaceHostController(
             this,
             dockPanel,
@@ -137,18 +148,8 @@ internal partial class LogTabWindow : Form, ILogTabWindow
                 exception.Message,
                 Resources.LogExpert_Common_UI_Title_Error,
                 MessageBoxButtons.OK,
-                MessageBoxIcon.Error)));
-
-        _toolWindowCoordinator = new ToolWindowCoordinator(configManager);
-
-        _ledService = new LedIndicatorService();
-        _ledService.Initialize(ConfigManager.Settings.Preferences.ShowTailColor);
-        _ledService.IconChanged += OnLedIconChanged;
-        _ledService.StartService();
-
-        _deadIcon = _ledService.GetDeadIcon();
-
-        _fileOperationService = new FileOperationService(configManager, _tabController, _ledService, PluginRegistry.PluginRegistry.Instance, CreateLogWindowFromRequest, () => Clipboard.ContainsText() ? Clipboard.GetText() : null, LoadSession);
+                MessageBoxIcon.Error)),
+            new MinecraftWorkspaceSourceNavigator(_fileOperationService.AddFileTab));
 
         _fileOperationService.FileHistoryChanged += (_, _) => FillHistoryMenu();
         _fileOperationService.FileOpened += OnFileOperationServiceFileOpened;

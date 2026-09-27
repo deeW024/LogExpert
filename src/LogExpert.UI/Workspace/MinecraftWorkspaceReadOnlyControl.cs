@@ -1,3 +1,5 @@
+#pragma warning disable CA1303 // Workspace navigation labels are intentionally local to this focused control.
+
 using System.Globalization;
 using System.Runtime.Versioning;
 using System.Text;
@@ -29,6 +31,8 @@ public sealed class MinecraftWorkspaceReadOnlyControl : UserControl
     private readonly CheckedListBox _threadFacetList;
     private readonly DataGridView _eventGrid;
     private readonly TextBox _detailsTextBox;
+    private readonly Button _showInSourceButton;
+    private readonly Label _sourceNavigationStatusLabel;
     private readonly HashSet<string> _selectedFileIds = new(StringComparer.Ordinal);
     private HashSet<MinecraftWorkspaceFacetValue<string>> _selectedSources = [];
     private HashSet<MinecraftWorkspaceFacetValue<string>> _selectedComponents = [];
@@ -143,6 +147,22 @@ public sealed class MinecraftWorkspaceReadOnlyControl : UserControl
         AddFacetTab("Thread", _threadFacetList);
 
         _eventGrid = CreateGrid();
+        _showInSourceButton = new Button
+        {
+            Name = "WorkspaceShowInSource",
+            Text = "Show in source",
+            AutoSize = true,
+            Enabled = false,
+            AccessibleName = "Show selected event in source",
+            AccessibleRole = AccessibleRole.PushButton
+        };
+        _sourceNavigationStatusLabel = new Label
+        {
+            Name = "WorkspaceSourceNavigationStatus",
+            AutoEllipsis = true,
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleLeft
+        };
         _detailsTextBox = new TextBox
         {
             Name = "WorkspaceEventDetails",
@@ -152,6 +172,32 @@ public sealed class MinecraftWorkspaceReadOnlyControl : UserControl
             ScrollBars = ScrollBars.Both,
             WordWrap = false
         };
+
+        TableLayoutPanel sourceNavigationBar = new()
+        {
+            Name = "WorkspaceSourceNavigationBar",
+            Dock = DockStyle.Fill,
+            ColumnCount = 2,
+            RowCount = 1,
+            Padding = new Padding(4, 2, 4, 2)
+        };
+        sourceNavigationBar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        sourceNavigationBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        sourceNavigationBar.Controls.Add(_showInSourceButton, 0, 0);
+        sourceNavigationBar.Controls.Add(_sourceNavigationStatusLabel, 1, 0);
+
+        TableLayoutPanel detailsLayout = new()
+        {
+            Name = "WorkspaceDetailsLayout",
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 2
+        };
+        detailsLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        detailsLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
+        detailsLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        detailsLayout.Controls.Add(sourceNavigationBar, 0, 0);
+        detailsLayout.Controls.Add(_detailsTextBox, 0, 1);
 
         Panel header = new() { Name = "WorkspaceHeader", Dock = DockStyle.Fill };
         header.Controls.Add(_statusLabel);
@@ -180,7 +226,7 @@ public sealed class MinecraftWorkspaceReadOnlyControl : UserControl
             Panel2MinSize = 120
         };
         eventSplit.Panel1.Controls.Add(_eventGrid);
-        eventSplit.Panel2.Controls.Add(_detailsTextBox);
+        eventSplit.Panel2.Controls.Add(detailsLayout);
         contentSplit.Panel2.Controls.Add(eventSplit);
 
         TableLayoutPanel root = new()
@@ -207,6 +253,7 @@ public sealed class MinecraftWorkspaceReadOnlyControl : UserControl
         _clearFiltersButton.Click += OnClearFilters;
         _followCheckBox.CheckedChanged += OnFollowChanged;
         _pauseButton.Click += OnPauseClicked;
+        _showInSourceButton.Click += OnShowInSourceClicked;
         _fileFacetList.ItemCheck += (_, e) => OnFacetItemCheck(_fileFacetList, _selectedFileIds, e);
         _sourceFacetList.ItemCheck += (_, e) => OnFacetItemCheck(_sourceFacetList, _selectedSources, e);
         _componentFacetList.ItemCheck += (_, e) => OnFacetItemCheck(_componentFacetList, _selectedComponents, e);
@@ -217,6 +264,8 @@ public sealed class MinecraftWorkspaceReadOnlyControl : UserControl
     }
 
     public event EventHandler<MinecraftWorkspaceFilterQueryChangedEventArgs>? FilterQueryChanged;
+
+    public event EventHandler<MinecraftWorkspaceShowInSourceEventArgs>? ShowInSourceRequested;
 
     public event EventHandler? PauseChanged;
 
@@ -262,6 +311,10 @@ public sealed class MinecraftWorkspaceReadOnlyControl : UserControl
 
     public TextBox DetailsTextBox => _detailsTextBox;
 
+    public Button ShowInSourceButton => _showInSourceButton;
+
+    public Label SourceNavigationStatusLabel => _sourceNavigationStatusLabel;
+
     public Label StatusLabel => _statusLabel;
 
     public long? SelectedIdentity { get; private set; }
@@ -270,6 +323,23 @@ public sealed class MinecraftWorkspaceReadOnlyControl : UserControl
 
     public MinecraftWorkspaceReadOnlyEventDetails? SelectedDetails { get; private set; }
 
+    public void SetSourceNavigationStatus (string? status)
+    {
+        VerifyUiThread();
+        _sourceNavigationStatusLabel.Text = status ?? string.Empty;
+    }
+
+    protected override bool ProcessCmdKey (ref Message msg, Keys keyData)
+    {
+        if (keyData == (Keys.Control | Keys.Enter) && (_eventGrid.ContainsFocus || _detailsTextBox.ContainsFocus))
+        {
+            RequestShowInSource();
+            return true;
+        }
+
+        return base.ProcessCmdKey(ref msg, keyData);
+    }
+
     /// <summary>Rebinds a completed presenter snapshot while preserving query and selection identity.</summary>
     public void ApplySnapshot (MinecraftWorkspaceReadOnlyViewSnapshot snapshot)
     {
@@ -277,6 +347,7 @@ public sealed class MinecraftWorkspaceReadOnlyControl : UserControl
         VerifyUiThread();
 
         long? previouslySelectedIdentity = SelectedIdentity;
+        string previousSourceNavigationStatus = _sourceNavigationStatusLabel.Text;
         int previousFirstDisplayedRow = _eventGrid.RowCount == 0 ? 0 : Math.Max(0, _eventGrid.FirstDisplayedScrollingRowIndex);
         long? anchorIdentity = !IsFollowEnabled && previousFirstDisplayedRow < _snapshot.Rows.Count
             ? _snapshot.Rows[previousFirstDisplayedRow].Identity
@@ -308,6 +379,7 @@ public sealed class MinecraftWorkspaceReadOnlyControl : UserControl
                 _eventGrid.CurrentCell = _eventGrid.Rows[newRowIndex].Cells[0];
                 _eventGrid.Rows[newRowIndex].Selected = true;
                 SelectIdentity(identity);
+                _sourceNavigationStatusLabel.Text = previousSourceNavigationStatus;
             }
 
             if (IsFollowEnabled)
@@ -674,9 +746,15 @@ public sealed class MinecraftWorkspaceReadOnlyControl : UserControl
     {
         int rowIndex = _rowIndexByIdentity[identity];
         MinecraftWorkspaceReadOnlyRow row = Snapshot.Rows[rowIndex];
+        if (SelectedIdentity != identity)
+        {
+            _sourceNavigationStatusLabel.Text = string.Empty;
+        }
+
         SelectedIdentity = identity;
         SelectedEntry = row.Entry;
         SelectedDetails = row.Details;
+        _showInSourceButton.Enabled = true;
         _detailsTextBox.Text = FormatDetails(row.Details);
     }
 
@@ -685,7 +763,23 @@ public sealed class MinecraftWorkspaceReadOnlyControl : UserControl
         SelectedIdentity = null;
         SelectedEntry = null;
         SelectedDetails = null;
+        _showInSourceButton.Enabled = false;
+        _sourceNavigationStatusLabel.Text = string.Empty;
         _detailsTextBox.Clear();
+    }
+
+    private void OnShowInSourceClicked (object? sender, EventArgs e) => RequestShowInSource();
+
+    private void RequestShowInSource ()
+    {
+        MinecraftWorkspaceTimelineEntry? entry = SelectedEntry;
+        if (entry == null)
+        {
+            return;
+        }
+
+        _sourceNavigationStatusLabel.Text = "Checking source…";
+        ShowInSourceRequested?.Invoke(this, new MinecraftWorkspaceShowInSourceEventArgs(entry));
     }
 
     private void RenderHeader ()
@@ -785,4 +879,9 @@ public sealed class MinecraftWorkspaceFacetEditorItem<TValue>
 public sealed class MinecraftWorkspaceFilterQueryChangedEventArgs (MinecraftWorkspaceTimelineFilterQuery query) : EventArgs
 {
     public MinecraftWorkspaceTimelineFilterQuery Query { get; } = query ?? throw new ArgumentNullException(nameof(query));
+}
+
+public sealed class MinecraftWorkspaceShowInSourceEventArgs (MinecraftWorkspaceTimelineEntry entry) : EventArgs
+{
+    public MinecraftWorkspaceTimelineEntry Entry { get; } = entry ?? throw new ArgumentNullException(nameof(entry));
 }

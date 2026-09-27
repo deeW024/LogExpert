@@ -220,6 +220,7 @@ internal sealed class MinecraftWorkspaceHostController : IDisposable
     private readonly Func<IMinecraftWorkspaceRefreshTrigger> _triggerFactory;
     private readonly IMinecraftWorkspaceHostDispatcher _dispatcher;
     private readonly Action<Exception> _showError;
+    private readonly IMinecraftWorkspaceSourceNavigator? _sourceNavigator;
     private readonly object _gate = new();
     private MinecraftWorkspaceHostSession? _activeSession;
     private int _disposed;
@@ -231,7 +232,8 @@ internal sealed class MinecraftWorkspaceHostController : IDisposable
         IMinecraftWorkspaceHostRuntimeFactory runtimeFactory,
         Func<IMinecraftWorkspaceRefreshTrigger> triggerFactory,
         IMinecraftWorkspaceHostDispatcher dispatcher,
-        Action<Exception> showError)
+        Action<Exception> showError,
+        IMinecraftWorkspaceSourceNavigator? sourceNavigator = null)
     {
         _owner = owner ?? throw new ArgumentNullException(nameof(owner));
         _dockPanel = dockPanel ?? throw new ArgumentNullException(nameof(dockPanel));
@@ -240,6 +242,7 @@ internal sealed class MinecraftWorkspaceHostController : IDisposable
         _triggerFactory = triggerFactory ?? throw new ArgumentNullException(nameof(triggerFactory));
         _dispatcher = dispatcher ?? throw new ArgumentNullException(nameof(dispatcher));
         _showError = showError ?? throw new ArgumentNullException(nameof(showError));
+        _sourceNavigator = sourceNavigator;
     }
 
     public MinecraftWorkspaceReadOnlyDocument? ActiveDocument
@@ -375,7 +378,8 @@ internal sealed class MinecraftWorkspaceHostController : IDisposable
                 _triggerFactory(),
                 _dispatcher,
                 session => IsCurrentSession(session),
-                OnDocumentClosed);
+                OnDocumentClosed,
+                _sourceNavigator);
             document.Show(_dockPanel, DockState.Document);
 
             MinecraftWorkspaceHostSession? previous;
@@ -452,6 +456,7 @@ internal sealed class MinecraftWorkspaceHostSession : IDisposable
     private readonly IMinecraftWorkspaceHostDispatcher _dispatcher;
     private readonly Func<MinecraftWorkspaceHostSession, bool> _isCurrent;
     private readonly Action<MinecraftWorkspaceHostSession> _documentClosed;
+    private readonly IMinecraftWorkspaceSourceNavigator? _sourceNavigator;
     private readonly object _gate = new();
     private bool _refreshRunning;
     private bool _refreshPending;
@@ -461,6 +466,7 @@ internal sealed class MinecraftWorkspaceHostSession : IDisposable
     private MinecraftWorkspaceReadOnlyViewSnapshot? _pausedSnapshot;
     private long _pausedSnapshotRevision;
     private long? _allowPausedApplyRevision;
+    private long _sourceNavigationRevision;
     private int _disposed;
 
     public MinecraftWorkspaceHostSession (
@@ -469,7 +475,8 @@ internal sealed class MinecraftWorkspaceHostSession : IDisposable
         IMinecraftWorkspaceRefreshTrigger trigger,
         IMinecraftWorkspaceHostDispatcher dispatcher,
         Func<MinecraftWorkspaceHostSession, bool> isCurrent,
-        Action<MinecraftWorkspaceHostSession> documentClosed)
+        Action<MinecraftWorkspaceHostSession> documentClosed,
+        IMinecraftWorkspaceSourceNavigator? sourceNavigator)
     {
         _runtime = runtime;
         Document = document;
@@ -477,10 +484,15 @@ internal sealed class MinecraftWorkspaceHostSession : IDisposable
         _dispatcher = dispatcher;
         _isCurrent = isCurrent;
         _documentClosed = documentClosed;
+        _sourceNavigator = sourceNavigator;
         _currentQuery = Document.WorkspaceControl.Snapshot.QuerySnapshot;
         Document.FormClosed += OnDocumentFormClosed;
         Document.WorkspaceControl.FilterQueryChanged += OnFilterQueryChanged;
         Document.WorkspaceControl.PauseChanged += OnPauseChanged;
+        if (_sourceNavigator != null)
+        {
+            Document.WorkspaceControl.ShowInSourceRequested += OnShowInSourceRequested;
+        }
     }
 
     public MinecraftWorkspaceReadOnlyDocument Document { get; }
@@ -519,6 +531,10 @@ internal sealed class MinecraftWorkspaceHostSession : IDisposable
         _trigger.Dispose();
         Document.WorkspaceControl.FilterQueryChanged -= OnFilterQueryChanged;
         Document.WorkspaceControl.PauseChanged -= OnPauseChanged;
+        if (_sourceNavigator != null)
+        {
+            Document.WorkspaceControl.ShowInSourceRequested -= OnShowInSourceRequested;
+        }
         Document.FormClosed -= OnDocumentFormClosed;
         try
         {
@@ -537,6 +553,102 @@ internal sealed class MinecraftWorkspaceHostSession : IDisposable
     }
 
     private void OnTriggerTick (object? sender, EventArgs e) => RequestRefresh();
+
+    private void OnShowInSourceRequested (object? sender, MinecraftWorkspaceShowInSourceEventArgs e)
+    {
+        IMinecraftWorkspaceSourceNavigator navigator = _sourceNavigator!;
+        long revision = Interlocked.Increment(ref _sourceNavigationRevision);
+        MinecraftWorkspaceTimelineEntry entry = e.Entry;
+        try
+        {
+            _dispatcher.QueueBackgroundWork(() => ValidateSourceTarget(navigator, entry, revision));
+        }
+        catch (Exception exception)
+        {
+            CompleteSourceNavigation(entry, CreateNavigationFailure(entry, exception), revision);
+        }
+    }
+
+    private void ValidateSourceTarget (
+        IMinecraftWorkspaceSourceNavigator navigator,
+        MinecraftWorkspaceTimelineEntry entry,
+        long revision)
+    {
+        MinecraftWorkspaceSourceNavigationResult result;
+        try
+        {
+            result = navigator.Validate(entry);
+        }
+        catch (Exception exception)
+        {
+            result = CreateNavigationFailure(entry, exception);
+        }
+
+        _ = _dispatcher.TryPostToUi(() => CompleteSourceNavigation(entry, result, revision));
+    }
+
+    private void CompleteSourceNavigation (
+        MinecraftWorkspaceTimelineEntry entry,
+        MinecraftWorkspaceSourceNavigationResult result,
+        long revision)
+    {
+        if (Volatile.Read(ref _disposed) != 0 ||
+            revision != Interlocked.Read(ref _sourceNavigationRevision) ||
+            !_isCurrent(this) ||
+            Document.IsDisposed ||
+            Document.WorkspaceControl.IsDisposed)
+        {
+            return;
+        }
+
+        if (result.Status == MinecraftWorkspaceSourceNavigationStatus.Success)
+        {
+            try
+            {
+                result = _sourceNavigator!.Open(entry, result);
+            }
+            catch (Exception exception)
+            {
+                result = CreateNavigationFailure(entry, exception);
+            }
+        }
+
+        Document.WorkspaceControl.SetSourceNavigationStatus(FormatSourceNavigationStatus(result));
+    }
+
+    private static MinecraftWorkspaceSourceNavigationResult CreateNavigationFailure (
+        MinecraftWorkspaceTimelineEntry entry,
+        Exception exception)
+    {
+        NormalizedLogEvent logEvent = entry.IngressEvent.Event;
+        FileRef file = logEvent.Ref.File;
+        long line = logEvent.Ref.StartLineNumber;
+        return new MinecraftWorkspaceSourceNavigationResult(
+            MinecraftWorkspaceSourceNavigationStatus.OpenFailed,
+            file.Path,
+            null,
+            file.FileId,
+            file.Generation,
+            line is >= 1 and <= int.MaxValue ? (int)line : 0,
+            false,
+            exception.Message);
+    }
+
+    private static string FormatSourceNavigationStatus (MinecraftWorkspaceSourceNavigationResult result)
+    {
+        string provenance = $"FileId {result.FileId}, generation {result.Generation}";
+        return result.Status switch
+        {
+            MinecraftWorkspaceSourceNavigationStatus.Success when result.WasRelocated =>
+                $"Source moved: {Path.GetFileName(result.OriginalPath)} → {Path.GetFileName(result.ResolvedPath)} · line {result.StartLineNumber}",
+            MinecraftWorkspaceSourceNavigationStatus.Success =>
+                $"Source opened: {Path.GetFileName(result.ResolvedPath)} · line {result.StartLineNumber}",
+            MinecraftWorkspaceSourceNavigationStatus.SourceUnavailable => $"Source unavailable · {provenance}",
+            MinecraftWorkspaceSourceNavigationStatus.SourceChanged => $"Source changed since this event was captured · {provenance}",
+            MinecraftWorkspaceSourceNavigationStatus.InvalidLocation => $"Invalid source location · {provenance}",
+            _ => $"Source open failed · {provenance}{(string.IsNullOrWhiteSpace(result.Error) ? string.Empty : $" · {result.Error}")}"
+        };
+    }
 
     private void OnFilterQueryChanged (object? sender, MinecraftWorkspaceFilterQueryChangedEventArgs e)
     {

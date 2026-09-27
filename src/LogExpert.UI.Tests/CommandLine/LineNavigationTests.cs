@@ -81,6 +81,57 @@ internal sealed class LineNavigationTests : IDisposable
         Assert.That(logWindow.GatherSessionSnapshot().FollowTail, Is.False);
     }
 
+    [Test]
+    public void ExactTargetWait_does_not_clamp_and_selects_the_requested_appended_line ()
+    {
+        LogWindow logWindow = Open(null);
+        WaitForLoad(logWindow);
+        int previousLine = logWindow.CurrentLineNum;
+
+        logWindow.RequestGotoLine(103, LogWindowTargetLineBehavior.WaitForExactTarget);
+
+        Assert.That(logWindow.CurrentLineNum, Is.EqualTo(previousLine), "A target beyond the loaded row count must remain pending.");
+        Assert.That(logWindow.GatherSessionSnapshot().FollowTail, Is.True, "Waiting must not navigate away from the current view.");
+
+        File.AppendAllLines(_fileName, Enumerable.Range(101, 3).Select(line => $"Appended line {line}"));
+        PumpUntil(() => logWindow.GatherSessionSnapshot().LineCount == 103 && logWindow.CurrentLineNum == 102);
+
+        Assert.That(logWindow.GatherSessionSnapshot().FollowTail, Is.False);
+    }
+
+    [Test]
+    public void NewerExactTarget_replaces_an_older_pending_target ()
+    {
+        LogWindow logWindow = Open(null);
+        WaitForLoad(logWindow);
+
+        logWindow.RequestGotoLine(103, LogWindowTargetLineBehavior.WaitForExactTarget);
+        logWindow.RequestGotoLine(104, LogWindowTargetLineBehavior.WaitForExactTarget);
+        File.AppendAllLines(_fileName, Enumerable.Range(101, 4).Select(line => $"Appended line {line}"));
+
+        PumpUntil(() => logWindow.GatherSessionSnapshot().LineCount == 104 && logWindow.CurrentLineNum == 103);
+
+        Assert.That(logWindow.GatherSessionSnapshot().FollowTail, Is.False);
+    }
+
+    [Test]
+    public void Truncation_cancels_a_pending_exact_target_from_the_previous_file_generation ()
+    {
+        LogWindow logWindow = Open(null);
+        WaitForLoad(logWindow);
+        logWindow.GotoLine(10);
+        logWindow.RequestGotoLine(120, LogWindowTargetLineBehavior.WaitForExactTarget);
+
+        File.WriteAllLines(_fileName, Enumerable.Range(1, 3).Select(line => $"Rewritten line {line}"));
+        PumpUntil(() => logWindow.GatherSessionSnapshot().LineCount == 3 && logWindow.CurrentLineNum >= 0);
+        logWindow.GotoLine(0);
+        File.AppendAllLines(_fileName, Enumerable.Range(4, 117).Select(line => $"Rewritten line {line}"));
+        PumpUntil(() => logWindow.GatherSessionSnapshot().LineCount == 120);
+        Application.DoEvents();
+
+        Assert.That(logWindow.CurrentLineNum, Is.EqualTo(0), "The canceled old-generation target must not activate after the file grows again.");
+    }
+
     [TestCase(false)]
     [TestCase(true)]
     public void Startup_SavedPositionAndTail_ExplicitTargetWins (bool savedFollowTail)
@@ -173,19 +224,21 @@ internal sealed class LineNavigationTests : IDisposable
     }
 
     [Test]
-    public void FailedInitialLoad_RespawnDoesNotReplayTarget ()
+    public void DeadFileCancelsPendingExactTargetBeforeRespawn ()
     {
-        File.Delete(_fileName);
-        var logWindow = Open(5);
+        var logWindow = Open(null);
+        WaitForLoad(logWindow);
+        logWindow.RequestGotoLine(120, LogWindowTargetLineBehavior.WaitForExactTarget);
         bool missing = false;
         logWindow.FileNotFound += (_, _) => missing = true;
+        File.Delete(_fileName);
         PumpUntil(() => missing);
 
         File.WriteAllLines(_fileName, Enumerable.Range(1, 100).Select(i => $"Restored line {i}"));
         WaitForLoad(logWindow);
 
         Assert.That(logWindow.GatherSessionSnapshot().FollowTail, Is.True);
-        Assert.That(logWindow.CurrentLineNum, Is.Not.EqualTo(4));
+        Assert.That(logWindow.CurrentLineNum, Is.Not.EqualTo(119));
     }
 
     [Test]
@@ -207,6 +260,7 @@ internal sealed class LineNavigationTests : IDisposable
     {
         var logWindow = Open(5);
         WaitForLoad(logWindow);
+        logWindow.RequestGotoLine(120, LogWindowTargetLineBehavior.WaitForExactTarget);
         _window!.Close();
 
         Assert.DoesNotThrow(() => logWindow.RequestGotoLine(42));
