@@ -143,19 +143,25 @@ internal sealed class MinecraftWorkspaceSourceNavigator (
             return validatedTarget;
         }
 
+        MinecraftWorkspaceSourceNavigationResult freshTarget = Validate(entry);
+        if (freshTarget.Status != MinecraftWorkspaceSourceNavigationStatus.Success || freshTarget.ResolvedPath == null)
+        {
+            return freshTarget;
+        }
+
         try
         {
             _ = _addFileTab(new FileTabRequest
             {
-                FileName = validatedTarget.ResolvedPath,
-                TargetLine = validatedTarget.StartLineNumber,
+                FileName = freshTarget.ResolvedPath,
+                TargetLine = freshTarget.StartLineNumber,
                 TargetLineBehavior = LogWindowTargetLineBehavior.WaitForExactTarget
             });
-            return validatedTarget;
+            return freshTarget;
         }
         catch (Exception exception)
         {
-            return validatedTarget with
+            return freshTarget with
             {
                 Status = MinecraftWorkspaceSourceNavigationStatus.OpenFailed,
                 Error = exception.Message

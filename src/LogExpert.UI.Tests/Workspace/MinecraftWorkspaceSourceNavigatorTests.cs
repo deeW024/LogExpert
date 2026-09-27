@@ -205,6 +205,79 @@ public sealed class MinecraftWorkspaceSourceNavigatorTests
     }
 
     [Test]
+    public void Open_revalidates_and_refuses_a_source_rewritten_after_validate_without_opening_a_tab ()
+    {
+        string path = Path.Join(_testDirectory, "latest.log");
+        const string rawText = "captured record";
+        File.WriteAllText(path, rawText + "\n", new UTF8Encoding(false));
+        MinecraftWorkspaceTimelineEntry entry = CreateEntry(path, rawText, 0);
+        EventRef originalEventRef = entry.IngressEvent.Event.Ref;
+        FileRef originalFileRef = originalEventRef.File;
+        int openCalls = 0;
+        MinecraftWorkspaceSourceNavigator navigator = new(_ =>
+        {
+            openCalls++;
+            return null!;
+        });
+
+        MinecraftWorkspaceSourceNavigationResult validated = navigator.Validate(entry);
+        File.WriteAllText(path, "rewritten bytes\n", new UTF8Encoding(false));
+        MinecraftWorkspaceSourceNavigationResult opened = navigator.Open(entry, validated);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(validated.Status, Is.EqualTo(MinecraftWorkspaceSourceNavigationStatus.Success));
+            Assert.That(opened.Status, Is.EqualTo(MinecraftWorkspaceSourceNavigationStatus.SourceChanged));
+            Assert.That(openCalls, Is.Zero);
+            Assert.That(entry.IngressEvent.Event.Ref, Is.SameAs(originalEventRef));
+            Assert.That(entry.IngressEvent.Event.Ref.File, Is.SameAs(originalFileRef));
+            Assert.That(originalFileRef.Path, Is.EqualTo(path));
+            Assert.That(originalFileRef.Generation, Is.EqualTo(1));
+        });
+    }
+
+    [Test]
+    public void Open_revalidates_a_CFM_relocation_and_uses_the_fresh_successor_path ()
+    {
+        string originalPath = Path.Join(_testDirectory, "cfm-session.jsonl.part");
+        string successorPath = Path.Join(_testDirectory, "cfm-session.jsonl");
+        const string prefix = "prefix\n";
+        const string rawText = "synthetic CFM event";
+        long start = Encoding.UTF8.GetByteCount(prefix);
+        File.WriteAllText(originalPath, prefix + rawText + "\n", new UTF8Encoding(false));
+        MinecraftWorkspaceTimelineEntry entry = CreateEntry(originalPath, rawText, start, line: 2);
+        EventRef originalEventRef = entry.IngressEvent.Event.Ref;
+        FileRef originalFileRef = originalEventRef.File;
+        FileTabRequest? capturedRequest = null;
+        MinecraftWorkspaceSourceNavigator navigator = new(request =>
+        {
+            capturedRequest = request;
+            return null!;
+        });
+
+        MinecraftWorkspaceSourceNavigationResult validated = navigator.Validate(entry);
+        File.Move(originalPath, successorPath);
+        MinecraftWorkspaceSourceNavigationResult opened = navigator.Open(entry, validated);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(validated.Status, Is.EqualTo(MinecraftWorkspaceSourceNavigationStatus.Success));
+            Assert.That(validated.ResolvedPath, Is.EqualTo(originalPath));
+            Assert.That(opened.Status, Is.EqualTo(MinecraftWorkspaceSourceNavigationStatus.Success));
+            Assert.That(opened.ResolvedPath, Is.EqualTo(successorPath));
+            Assert.That(opened.WasRelocated, Is.True);
+            Assert.That(opened.StartLineNumber, Is.EqualTo(2));
+            Assert.That(capturedRequest, Is.Not.Null);
+            Assert.That(capturedRequest!.FileName, Is.EqualTo(successorPath));
+            Assert.That(capturedRequest.TargetLine, Is.EqualTo(2));
+            Assert.That(entry.IngressEvent.Event.Ref, Is.SameAs(originalEventRef));
+            Assert.That(entry.IngressEvent.Event.Ref.File, Is.SameAs(originalFileRef));
+            Assert.That(originalFileRef.Path, Is.EqualTo(originalPath));
+            Assert.That(originalFileRef.Generation, Is.EqualTo(1));
+        });
+    }
+
+    [Test]
     public void Open_does_not_call_file_operations_for_an_unverified_target_and_reports_open_failure ()
     {
         string path = Path.Join(_testDirectory, "latest.log");
