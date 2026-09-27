@@ -15,6 +15,7 @@ using LogExpert.Core.Entities;
 using LogExpert.Core.Enums;
 using LogExpert.Core.Interfaces;
 using LogExpert.UI.Controls.LogTabWindow;
+using LogExpert.UI.Controls.LogWindow;
 using LogExpert.UI.Interface;
 using LogExpert.UI.Workspace;
 
@@ -997,10 +998,267 @@ public sealed class MinecraftWorkspaceHostControllerTests
         Assert.That(_host.Controller.ActiveDocument, Is.Null);
     }
 
+    [Test]
+    public void Show_in_source_keeps_workspace_selection_query_follow_and_pause_unchanged ()
+    {
+        MinecraftWorkspaceIngressEvent ingress = CreateHostIngress("show-source-file", 1, "selected source record");
+        MinecraftWorkspaceReadOnlyViewSnapshot snapshot = Snapshot("source-navigation", [ingress], new MinecraftWorkspaceTimelineFilterQuery());
+        FakeRuntime runtime = new("source-navigation", _ => snapshot);
+        FakeSourceNavigator navigator = new();
+        _host = CreateHost(new FakeRuntimeFactory { CreateRuntime = _ => runtime }, new FakePicker(null), sourceNavigator: navigator);
+        OpenAndDrainInitialRefresh(_host, "source-navigation-root");
+        MinecraftWorkspaceReadOnlyControl control = _host.Controller.ActiveDocument!.WorkspaceControl;
+        control.EventGrid.CurrentCell = control.EventGrid.Rows[0].Cells[0];
+        control.EventGrid.Rows[0].Selected = true;
+        Application.DoEvents();
+        control.SearchTextBox.Text = "selected";
+        _host.Dispatcher.DrainBackgroundAndUi();
+        control.FollowCheckBox.Checked = false;
+        control.PauseButton.PerformClick();
+        Application.DoEvents();
+
+        MinecraftWorkspaceTimelineEntry selectedEntry = control.SelectedEntry!;
+        EventRef selectedEventRef = selectedEntry.IngressEvent.Event.Ref;
+        FileRef selectedFileRef = selectedEventRef.File;
+        MinecraftWorkspaceTimelineFilterQuery appliedQuery = control.Snapshot.QuerySnapshot;
+        long selectedIdentity = control.SelectedIdentity!.Value;
+        control.ShowInSourceButton.PerformClick();
+        _host.Dispatcher.RunNextBackground();
+        _host.Dispatcher.RunNextUi();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(navigator.ValidatedEntries, Has.Count.EqualTo(1));
+            Assert.That(navigator.ValidatedEntries[0], Is.SameAs(selectedEntry));
+            Assert.That(navigator.OpenedEntries, Has.Count.EqualTo(1));
+            Assert.That(navigator.OpenedEntries[0], Is.SameAs(selectedEntry));
+            Assert.That(control.SourceNavigationStatusLabel.Text, Does.Contain("Source opened:"));
+            Assert.That(control.Snapshot.QuerySnapshot, Is.SameAs(appliedQuery));
+            Assert.That(control.SelectedIdentity, Is.EqualTo(selectedIdentity));
+            Assert.That(control.SelectedDetails!.EventRef, Is.SameAs(selectedEventRef));
+            Assert.That(control.SelectedDetails.FileRef, Is.SameAs(selectedFileRef));
+            Assert.That(control.IsFollowEnabled, Is.False);
+            Assert.That(control.IsPaused, Is.True);
+            Assert.That(control.BacklogCount, Is.Zero);
+            Assert.That(_host.Errors, Is.Empty);
+        });
+    }
+
+    [Test]
+    public void Source_navigation_completion_from_closed_workspace_is_discarded ()
+    {
+        MinecraftWorkspaceIngressEvent ingress = CreateHostIngress("stale-source-file", 1, "selected source record");
+        MinecraftWorkspaceReadOnlyViewSnapshot snapshot = Snapshot("stale-source", [ingress], new MinecraftWorkspaceTimelineFilterQuery());
+        FakeRuntime runtime = new("stale-source", _ => snapshot);
+        FakeSourceNavigator navigator = new();
+        _host = CreateHost(new FakeRuntimeFactory { CreateRuntime = _ => runtime }, new FakePicker(null), sourceNavigator: navigator);
+        OpenAndDrainInitialRefresh(_host, "stale-source-root");
+        MinecraftWorkspaceReadOnlyDocument document = _host.Controller.ActiveDocument!;
+        MinecraftWorkspaceReadOnlyControl control = document.WorkspaceControl;
+        control.EventGrid.CurrentCell = control.EventGrid.Rows[0].Cells[0];
+        control.EventGrid.Rows[0].Selected = true;
+        Application.DoEvents();
+        control.ShowInSourceButton.PerformClick();
+        _host.Dispatcher.RunNextBackground();
+
+        document.Close();
+        _host.Dispatcher.DrainUi();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(navigator.ValidatedEntries, Has.Count.EqualTo(1));
+            Assert.That(navigator.OpenedEntries, Is.Empty);
+            Assert.That(_host.Controller.ActiveDocument, Is.Null);
+            Assert.That(document.IsDisposed, Is.True);
+        });
+    }
+
+    [Test]
+    public void Real_show_in_source_opens_and_reuses_the_normal_LogWindow_at_exact_physical_lines ()
+    {
+        string latestPath = CreateFile(
+            "logs/latest.log",
+            "[18:41:01] [Render thread/INFO] synthetic first source line\n" +
+            "[18:41:02] [Render thread/ERROR] synthetic second source line\n");
+        string yeezusPath = CreateFile(
+            "logs/yeezus.log",
+            "2099-01-01T10:00:00Z [INFO] [yeezus-core] [Client thread] synthetic multiline source header\n" +
+            "    at synthetic.Stack.run(Stack.java:42)\n" +
+            "2099-01-01T10:01:00Z [INFO] [yeezus-core] [Client thread] synthetic following header\n");
+        string cfmPartPath = CreateFile(
+            "cactusmonitor/sessions/cfm-source-nav.jsonl.part",
+            $"{{\"type\":\"CYCLE\",\"sessionId\":\"source-nav\",\"sequence\":1,\"timestampEpochMillis\":{Utc("2099-01-01T10:02:00Z").ToUnixTimeMilliseconds()}}}\n");
+        Settings settings = new();
+        var fontConverter = TypeDescriptor.GetConverter(typeof(Font));
+        settings.Preferences.Font = (Font)fontConverter.ConvertFromInvariantString(settings.Preferences.FontString)!;
+        settings.Preferences.AskForClose = false;
+        settings.Preferences.SaveSessions = false;
+        Mock<IConfigManager> configManager = new();
+        _ = configManager.Setup(item => item.Settings).Returns(settings);
+        _ = configManager.Setup(item => item.ActiveConfigDir).Returns(_testDirectory);
+        _ = configManager.Setup(item => item.ActiveSessionDir).Returns(_testDirectory);
+        TrackingWorkspaceRuntimeFactory runtimeFactory = new(
+            new MinecraftWorkspaceHostRuntimeFactory(PluginRegistry.PluginRegistry.Instance, 2048));
+        ManualRefreshTriggerFactory triggerFactory = new();
+        QueuedHostDispatcher dispatcher = new();
+        List<Exception> errors = [];
+        CultureInfo previousUiCulture = CultureInfo.CurrentUICulture;
+        CultureInfo.CurrentUICulture = CultureInfo.GetCultureInfo("en-US");
+        LogTabWindow window = new(
+            [],
+            1,
+            false,
+            configManager.Object,
+            null,
+            new FakePicker(_testDirectory),
+            runtimeFactory,
+            triggerFactory.Create,
+            dispatcher,
+            errors.Add);
+        _ = _host = new TestHost(window, GetDockPanel(window), window.WorkspaceHostController, dispatcher, triggerFactory, errors);
+
+        try
+        {
+            window.Show();
+            Application.DoEvents();
+            Task<bool> openWorkspace = window.WorkspaceHostController.OpenWorkspaceAsync(_testDirectory);
+            dispatcher.RunNextBackground();
+            dispatcher.RunNextUi();
+            Assert.That(openWorkspace.GetAwaiter().GetResult(), Is.True);
+            MinecraftWorkspaceReadOnlyDocument workspaceDocument = window.WorkspaceHostController.ActiveDocument!;
+            MinecraftWorkspaceReadOnlyControl control = workspaceDocument.WorkspaceControl;
+            PumpUntil(_host, () => control.Snapshot.Rows.Any(row =>
+                row.Details.PhysicalPath == latestPath && row.Details.RawText.Contains("synthetic second source line", StringComparison.Ordinal)));
+
+            MinecraftWorkspaceReadOnlyRow secondRow = control.Snapshot.Rows.Single(row =>
+                row.Details.PhysicalPath == latestPath && row.Details.RawText.Contains("synthetic second source line", StringComparison.Ordinal));
+            int secondRowIndex = control.Snapshot.Rows.ToList().IndexOf(secondRow);
+            control.EventGrid.CurrentCell = control.EventGrid.Rows[secondRowIndex].Cells[0];
+            control.EventGrid.Rows[secondRowIndex].Selected = true;
+            Application.DoEvents();
+            long selectedIdentity = control.SelectedIdentity!.Value;
+            control.ShowInSourceButton.PerformClick();
+            dispatcher.RunNextBackground();
+            dispatcher.RunNextUi();
+
+            ITabController tabController = GetTabController(window);
+            LogWindow sourceWindow = tabController.FindWindowByFileName(latestPath)!;
+            WaitForSourceLoad(_host, sourceWindow);
+            Assert.That(
+                sourceWindow.CurrentLineNum,
+                Is.EqualTo(checked((int)secondRow.Details.StartLineNumber - 1)),
+                $"Current source row={sourceWindow.CurrentLineNum}; event physical line={secondRow.Details.StartLineNumber}; navigation status={control.SourceNavigationStatusLabel.Text}");
+
+            int firstRowIndex = control.Snapshot.Rows.ToList().FindIndex(row =>
+                row.Details.PhysicalPath == latestPath && row.Details.RawText.Contains("synthetic first source line", StringComparison.Ordinal));
+            Assert.That(firstRowIndex, Is.GreaterThanOrEqualTo(0));
+            workspaceDocument.Activate();
+            Application.DoEvents();
+            control.EventGrid.CurrentCell = control.EventGrid.Rows[firstRowIndex].Cells[0];
+            control.EventGrid.Rows[firstRowIndex].Selected = true;
+            Application.DoEvents();
+            long secondSelectedIdentity = control.SelectedIdentity!.Value;
+            control.ShowInSourceButton.PerformClick();
+            dispatcher.RunNextBackground();
+            dispatcher.RunNextUi();
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(tabController.GetAllWindows(), Has.Count.EqualTo(1));
+                Assert.That(tabController.FindWindowByFileName(latestPath), Is.SameAs(sourceWindow));
+                Assert.That(sourceWindow.CurrentLineNum, Is.Zero);
+                Assert.That(control.SelectedIdentity, Is.EqualTo(secondSelectedIdentity));
+                Assert.That(control.SelectedIdentity, Is.Not.EqualTo(selectedIdentity));
+                Assert.That(control.SourceNavigationStatusLabel.Text, Does.Contain("Source opened:"));
+                Assert.That(control.IsPaused, Is.False);
+                Assert.That(control.Snapshot.QuerySnapshot.SearchText, Is.Null);
+                Assert.That(errors, Is.Empty);
+            });
+
+        File.WriteAllText(
+            latestPath,
+            "[18:41:01] [Render thread/INFO] synthetic first source gone\n" +
+            "[18:41:02] [Render thread/ERROR] synthetic second source line\n",
+            new UTF8Encoding(false));
+        workspaceDocument.Activate();
+        Application.DoEvents();
+        control.ShowInSourceButton.PerformClick();
+        dispatcher.RunNextBackground();
+        dispatcher.RunNextUi();
+        Assert.Multiple(() =>
+        {
+            Assert.That(control.SourceNavigationStatusLabel.Text, Does.Contain("Source changed since this event was captured"));
+            Assert.That(tabController.GetAllWindows(), Has.Count.EqualTo(1));
+            Assert.That(tabController.FindWindowByFileName(latestPath), Is.SameAs(sourceWindow));
+            Assert.That(sourceWindow.CurrentLineNum, Is.Zero);
+        });
+
+        workspaceDocument.Activate();
+        PumpUntil(_host, () => control.Snapshot.Rows.Any(row =>
+            row.Details.PhysicalPath == cfmPartPath && row.Details.RawText.Contains("source-nav", StringComparison.Ordinal)));
+        MinecraftWorkspaceReadOnlyRow cfmRow = control.Snapshot.Rows.Single(row =>
+            row.Details.PhysicalPath == cfmPartPath && row.Details.RawText.Contains("source-nav", StringComparison.Ordinal));
+        int cfmRowIndex = control.Snapshot.Rows.ToList().IndexOf(cfmRow);
+        string cfmFinalPath = cfmPartPath[..^".part".Length];
+        File.Move(cfmPartPath, cfmFinalPath);
+        control.EventGrid.CurrentCell = control.EventGrid.Rows[cfmRowIndex].Cells[0];
+        control.EventGrid.Rows[cfmRowIndex].Selected = true;
+        Application.DoEvents();
+        control.ShowInSourceButton.PerformClick();
+        dispatcher.RunNextBackground();
+        dispatcher.RunNextUi();
+        LogWindow cfmWindow = tabController.FindWindowByFileName(cfmFinalPath)!;
+        WaitForSourceLoad(_host, cfmWindow);
+        Assert.Multiple(() =>
+        {
+            Assert.That(cfmWindow.CurrentLineNum, Is.Zero);
+            Assert.That(control.SourceNavigationStatusLabel.Text, Does.Contain("Source moved:"));
+            Assert.That(control.SourceNavigationStatusLabel.Text, Does.Contain(Path.GetFileName(cfmFinalPath)));
+            Assert.That(tabController.GetAllWindows(), Has.Count.EqualTo(2));
+        });
+
+        workspaceDocument.Activate();
+        PumpUntil(_host, () => control.Snapshot.Rows.Any(row =>
+            row.Details.PhysicalPath == yeezusPath && row.Details.RawText.Contains("synthetic.Stack.run", StringComparison.Ordinal)));
+        int yeezusRowIndex = control.Snapshot.Rows.ToList().FindIndex(row =>
+            row.Details.PhysicalPath == yeezusPath && row.Details.RawText.Contains("synthetic.Stack.run", StringComparison.Ordinal));
+        Assert.That(yeezusRowIndex, Is.GreaterThanOrEqualTo(0));
+        control.EventGrid.CurrentCell = control.EventGrid.Rows[yeezusRowIndex].Cells[0];
+        control.EventGrid.Rows[yeezusRowIndex].Selected = true;
+        Application.DoEvents();
+        MinecraftWorkspaceTimelineEntry yeezusEntry = control.SelectedEntry!;
+        control.ShowInSourceButton.PerformClick();
+        dispatcher.RunNextBackground();
+        dispatcher.RunNextUi();
+        LogWindow yeezusWindow = tabController.FindWindowByFileName(yeezusPath)!;
+        WaitForSourceLoad(_host, yeezusWindow);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(yeezusEntry.IngressEvent.Event.Ref.StartLineNumber, Is.EqualTo(1));
+            Assert.That(yeezusWindow.CurrentLineNum, Is.Zero, "The multiline event navigates to its physical header line.");
+            Assert.That(tabController.GetAllWindows(), Has.Count.EqualTo(3));
+            Assert.That(tabController.FindWindowByFileName(yeezusPath), Is.SameAs(yeezusWindow));
+            Assert.That(control.SelectedEntry, Is.SameAs(yeezusEntry));
+        });
+        }
+        finally
+        {
+            if (!window.IsDisposed)
+            {
+                window.Close();
+                window.Dispose();
+            }
+
+            CultureInfo.CurrentUICulture = previousUiCulture;
+        }
+    }
+
     private TestHost CreateHost (
         IMinecraftWorkspaceHostRuntimeFactory runtimeFactory,
         FakePicker picker,
-        Func<IMinecraftWorkspaceRefreshTrigger>? refreshTriggerFactory = null)
+        Func<IMinecraftWorkspaceRefreshTrigger>? refreshTriggerFactory = null,
+        IMinecraftWorkspaceSourceNavigator? sourceNavigator = null)
     {
         Form form = new()
         {
@@ -1028,7 +1286,8 @@ public sealed class MinecraftWorkspaceHostControllerTests
             runtimeFactory,
             refreshTriggerFactory,
             dispatcher,
-            errors.Add);
+            errors.Add,
+            sourceNavigator);
         return _host = new TestHost(form, dockPanel, controller, dispatcher, triggerFactory, errors);
     }
 
@@ -1082,6 +1341,14 @@ public sealed class MinecraftWorkspaceHostControllerTests
             $"Scope={host.Controller.ActiveDocument?.WorkspaceControl.Snapshot.QuerySnapshot.TextScope}, " +
             $"Live={host.Controller.ActiveDocument?.WorkspaceControl.LiveStateLabel.Text}, " +
             $"VisibleRows={host.Controller.ActiveDocument?.WorkspaceControl.Snapshot.Rows.Count}");
+    }
+
+    private static void WaitForSourceLoad (TestHost host, LogWindow sourceWindow)
+    {
+        Task finished = Task.Run(sourceWindow.WaitForLoadingFinished);
+        PumpUntil(host, () => finished.IsCompleted);
+        finished.GetAwaiter().GetResult();
+        Application.DoEvents();
     }
 
     private static bool IsAtTail (DataGridView grid) => grid.RowCount == 0 ||
@@ -1184,6 +1451,35 @@ public sealed class MinecraftWorkspaceHostControllerTests
         {
             CallCount++;
             return Path;
+        }
+    }
+
+    private sealed class FakeSourceNavigator : IMinecraftWorkspaceSourceNavigator
+    {
+        public List<MinecraftWorkspaceTimelineEntry> ValidatedEntries { get; } = [];
+
+        public List<MinecraftWorkspaceTimelineEntry> OpenedEntries { get; } = [];
+
+        public MinecraftWorkspaceSourceNavigationResult Validate (MinecraftWorkspaceTimelineEntry entry)
+        {
+            ValidatedEntries.Add(entry);
+            NormalizedLogEvent logEvent = entry.IngressEvent.Event;
+            return new MinecraftWorkspaceSourceNavigationResult(
+                MinecraftWorkspaceSourceNavigationStatus.Success,
+                logEvent.Ref.File.Path,
+                logEvent.Ref.File.Path,
+                logEvent.Ref.File.FileId,
+                logEvent.Ref.File.Generation,
+                checked((int)logEvent.Ref.StartLineNumber),
+                false);
+        }
+
+        public MinecraftWorkspaceSourceNavigationResult Open (
+            MinecraftWorkspaceTimelineEntry entry,
+            MinecraftWorkspaceSourceNavigationResult validatedTarget)
+        {
+            OpenedEntries.Add(entry);
+            return validatedTarget;
         }
     }
 

@@ -41,6 +41,12 @@ using WeifenLuo.WinFormsUI.Docking;
 
 namespace LogExpert.UI.Controls.LogWindow;
 
+internal enum LogWindowTargetLineBehavior
+{
+    ClampToLoadedRange,
+    WaitForExactTarget
+}
+
 [SupportedOSPlatform("windows")]
 internal partial class LogWindow : DockContent, ILogPaintContextUI, ILogView, ILogWindow, ITimestampSource, ITailFollowSink
 {
@@ -134,6 +140,7 @@ internal partial class LogWindow : DockContent, ILogPaintContextUI, ILogView, IL
     private bool _isLoading;
     private bool _isReadyForLineNavigation;
     private int? _pendingTargetLine;
+    private LogWindowTargetLineBehavior _pendingTargetLineBehavior;
     private bool _isSearching;
 
     private List<int> _lastFilterLinesList = [];
@@ -2928,6 +2935,12 @@ internal partial class LogWindow : DockContent, ILogPaintContextUI, ILogView, IL
             //_logger.Info($"ReloadNewFile(): counter = {_reloadOverloadCounter}");
             if (_reloadOverloadCounter <= 1)
             {
+                if (_pendingTargetLineBehavior == LogWindowTargetLineBehavior.WaitForExactTarget)
+                {
+                    _pendingTargetLine = null;
+                    _pendingTargetLineBehavior = LogWindowTargetLineBehavior.ClampToLoadedRange;
+                }
+
                 SavePersistenceData(false);
                 _ = _loadingFinishedEvent.Reset();
                 _ = _externaLoadingFinishedEvent.Reset();
@@ -3107,6 +3120,14 @@ internal partial class LogWindow : DockContent, ILogPaintContextUI, ILogView, IL
         var oldRowCount = dataGridView.RowCount;
         var firstDisplayedLine = dataGridView.FirstDisplayedScrollingRowIndex;
 
+        if (dataGridView.RowCount > logEventArgs.LineCount &&
+            _pendingTargetLineBehavior == LogWindowTargetLineBehavior.WaitForExactTarget)
+        {
+            // A source navigation target belongs to the old physical generation after a truncate.
+            _pendingTargetLine = null;
+            _pendingTargetLineBehavior = LogWindowTargetLineBehavior.ClampToLoadedRange;
+        }
+
         if (dataGridView.CurrentCellAddress.Y >= logEventArgs.LineCount)
         {
             //this.dataGridView.Rows[this.dataGridView.CurrentCellAddress.Y].Selected = false;
@@ -3165,6 +3186,11 @@ internal partial class LogWindow : DockContent, ILogPaintContextUI, ILogView, IL
 
             _statusEventArgs.LineCount = logEventArgs.LineCount;
             StatusLineFileSize(logEventArgs.FileSize);
+
+            if (_isReadyForLineNavigation)
+            {
+                ApplyPendingLineNavigation();
+            }
 
             if (!_isLoading)
             {
@@ -6482,15 +6508,22 @@ internal partial class LogWindow : DockContent, ILogPaintContextUI, ILogView, IL
     /// Selects a one-based line after loading and Session File restoration, or immediately
     /// when ready. Called on the UI thread; a newer request replaces a pending one.
     /// </summary>
-    public void RequestGotoLine (int targetLine)
+    public void RequestGotoLine (
+        int targetLine,
+        LogWindowTargetLineBehavior behavior = LogWindowTargetLineBehavior.ClampToLoadedRange)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(targetLine, 1);
+        if (!Enum.IsDefined(behavior))
+        {
+            throw new ArgumentOutOfRangeException(nameof(behavior));
+        }
         if (IsDisposed || Disposing || _waitingForClose || _isClosing || _isDeadFile || _isLoadError)
         {
             return;
         }
 
         _pendingTargetLine = targetLine;
+        _pendingTargetLineBehavior = behavior;
         if (_isReadyForLineNavigation)
         {
             ApplyPendingLineNavigation();
@@ -6500,11 +6533,21 @@ internal partial class LogWindow : DockContent, ILogPaintContextUI, ILogView, IL
     private void ApplyPendingLineNavigation ()
     {
         var targetLine = _pendingTargetLine;
-        _pendingTargetLine = null;
         if (!targetLine.HasValue || IsDisposed || Disposing || _waitingForClose || _isClosing || _isDeadFile || _isLoadError)
+        {
+            _pendingTargetLine = null;
+            _pendingTargetLineBehavior = LogWindowTargetLineBehavior.ClampToLoadedRange;
+            return;
+        }
+
+        if (_pendingTargetLineBehavior == LogWindowTargetLineBehavior.WaitForExactTarget &&
+            targetLine.Value > dataGridView.RowCount)
         {
             return;
         }
+
+        _pendingTargetLine = null;
+        _pendingTargetLineBehavior = LogWindowTargetLineBehavior.ClampToLoadedRange;
 
         FollowTailChanged(false, false);
         if (dataGridView.RowCount > 0)
@@ -6519,6 +6562,7 @@ internal partial class LogWindow : DockContent, ILogPaintContextUI, ILogView, IL
     private void CancelPendingLineNavigation ()
     {
         _pendingTargetLine = null;
+        _pendingTargetLineBehavior = LogWindowTargetLineBehavior.ClampToLoadedRange;
         _isReadyForLineNavigation = false;
     }
 

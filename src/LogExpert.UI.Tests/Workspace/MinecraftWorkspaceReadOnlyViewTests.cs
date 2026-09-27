@@ -1,6 +1,7 @@
 #pragma warning disable CA1303 // Test fixtures intentionally use synthetic, assertion-visible strings.
 
 using System.Runtime.Versioning;
+using System.Reflection;
 using System.Text;
 
 using LogExpert.Core.Classes.MinecraftLogs;
@@ -352,6 +353,75 @@ public sealed class MinecraftWorkspaceReadOnlyViewTests
             Assert.That(control.SelectedDetails.FileRef, Is.SameAs(snapshot.Rows[1].Entry.IngressEvent.Event.Ref.File));
             Assert.That(control.DetailsTextBox.Text, Does.Contain("selected raw detail"));
         });
+    }
+
+    [Test]
+    public void Show_in_source_uses_the_exact_selected_entry_and_keyboard_shortcut_without_changing_workspace_state ()
+    {
+        MinecraftWorkspaceIngressEvent first = CreateIngress(1, "show-source-first", 1, "first", Utc("2030-01-01T10:00:00Z"));
+        MinecraftWorkspaceIngressEvent second = CreateIngress(2, "show-source-second", 1, "selected", Utc("2030-01-01T10:01:00Z"));
+        MinecraftWorkspaceReadOnlyViewSnapshot snapshot = ViewSnapshot(first, second);
+        using var form = CreateForm();
+        using var control = new MinecraftWorkspaceReadOnlyControl(snapshot);
+        form.Controls.Add(control);
+        form.Show();
+        Application.DoEvents();
+        List<MinecraftWorkspaceTimelineEntry> requestedEntries = [];
+        control.ShowInSourceRequested += (_, args) => requestedEntries.Add(args.Entry);
+
+        Assert.That(control.ShowInSourceButton.Enabled, Is.False);
+        SelectRow(control, 1);
+        control.FollowCheckBox.Checked = false;
+        control.PauseButton.PerformClick();
+        Application.DoEvents();
+
+        MinecraftWorkspaceTimelineEntry selectedEntry = snapshot.Rows[1].Entry;
+        long selectedIdentity = selectedEntry.Identity;
+        EventRef selectedEventRef = selectedEntry.IngressEvent.Event.Ref;
+        FileRef selectedFileRef = selectedEventRef.File;
+        MinecraftWorkspaceTimelineFilterQuery appliedQuery = control.Snapshot.QuerySnapshot;
+        int emittedQueryCount = 0;
+        control.FilterQueryChanged += (_, _) => emittedQueryCount++;
+        control.ShowInSourceButton.PerformClick();
+        Assert.That(control.SourceNavigationStatusLabel.Text, Is.EqualTo("Checking source…"));
+
+        control.EventGrid.Focus();
+        Application.DoEvents();
+        bool handledShortcut = SendControlEnter(control);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(control.ShowInSourceButton.Enabled, Is.True);
+            Assert.That(handledShortcut, Is.True);
+            Assert.That(requestedEntries, Has.Count.EqualTo(2));
+            Assert.That(requestedEntries.All(entry => ReferenceEquals(entry, selectedEntry)), Is.True);
+            Assert.That(control.SelectedEntry, Is.SameAs(selectedEntry));
+            Assert.That(control.SelectedIdentity, Is.EqualTo(selectedIdentity));
+            Assert.That(control.SelectedDetails!.EventRef, Is.SameAs(selectedEventRef));
+            Assert.That(control.SelectedDetails.FileRef, Is.SameAs(selectedFileRef));
+            Assert.That(control.Snapshot.QuerySnapshot, Is.SameAs(appliedQuery));
+            Assert.That(control.IsFollowEnabled, Is.False);
+            Assert.That(control.IsPaused, Is.True);
+            Assert.That(control.BacklogCount, Is.Zero);
+            Assert.That(emittedQueryCount, Is.Zero);
+        });
+
+        control.SetSourceNavigationStatus("Source changed since this event was captured");
+        control.ApplySnapshot(snapshot);
+        Assert.Multiple(() =>
+        {
+            Assert.That(control.SourceNavigationStatusLabel.Text, Is.EqualTo("Source changed since this event was captured"));
+            Assert.That(control.SelectedEntry, Is.SameAs(selectedEntry));
+            Assert.That(control.SelectedIdentity, Is.EqualTo(selectedIdentity));
+        });
+    }
+
+    private static bool SendControlEnter (MinecraftWorkspaceReadOnlyControl control)
+    {
+        Message message = Message.Create(IntPtr.Zero, 0x0100, (IntPtr)Keys.Enter, IntPtr.Zero);
+        object?[] arguments = [message, Keys.Control | Keys.Enter];
+        var processCmdKey = typeof(MinecraftWorkspaceReadOnlyControl).GetMethod("ProcessCmdKey", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        return (bool)processCmdKey.Invoke(control, arguments)!;
     }
 
     [Test]

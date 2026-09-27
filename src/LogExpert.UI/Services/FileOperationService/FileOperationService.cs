@@ -82,7 +82,7 @@ internal sealed class FileOperationService (
             _tabController.ActivateWindow(existingWindow);
             if (request.TargetLine is int existingTarget)
             {
-                existingWindow.RequestGotoLine(existingTarget);
+                existingWindow.RequestGotoLine(existingTarget, request.TargetLineBehavior);
             }
             return existingWindow;
         }
@@ -110,7 +110,7 @@ internal sealed class FileOperationService (
         // Register before starting the asynchronous load, including very small files.
         if (request.TargetLine is int targetLine)
         {
-            logWindow.RequestGotoLine(targetLine);
+            logWindow.RequestGotoLine(targetLine, request.TargetLineBehavior);
         }
 
         _ = Task.Run(() => logWindow.LoadFile(logFileName, encodingOptions));

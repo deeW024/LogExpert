@@ -1,4 +1,5 @@
 using ColumnizerLib;
+using LogExpert.UI.Controls.LogWindow;
 
 namespace LogExpert.UI.Services.FileOperationService;
 
@@ -14,6 +15,9 @@ internal sealed record FileTabRequest
 
     /// <summary>Optional one-based line to select after loading and Session File restoration.</summary>
     public int? TargetLine { get; init; }
+
+    /// <summary>Controls whether a target beyond the current row count is clamped or kept pending.</summary>
+    public LogWindowTargetLineBehavior TargetLineBehavior { get; init; }
 
     /// <summary>
     /// Whether this is a temporary file (filter results, clipboard paste).
