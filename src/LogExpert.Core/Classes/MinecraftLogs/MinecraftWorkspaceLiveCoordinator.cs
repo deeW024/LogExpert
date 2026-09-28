@@ -355,6 +355,12 @@ public sealed class MinecraftWorkspaceLiveCoordinator : IDisposable
                 {
                     foreach (DiscoveredSourceFile source in _discoveredSources.Values.Where(source => source.SourceId == sourceId))
                     {
+                        if (_sources.TryGetValue(source.FileId, out MinecraftWorkspaceSourceRuntimeState? existing) &&
+                            existing.Status == MinecraftWorkspaceSourceStatus.ImmutableComplete)
+                        {
+                            continue;
+                        }
+
                         MinecraftSourceHandoffCheckpoint? checkpoint = GetSuspendedCheckpointUnsafe(sourceId);
                         SourceProgress progress = _fileProgress.TryGetValue(source.FileId, out SourceProgress? saved)
                             ? saved

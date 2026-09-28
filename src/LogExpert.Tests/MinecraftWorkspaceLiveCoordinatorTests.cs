@@ -1026,6 +1026,91 @@ internal sealed class MinecraftWorkspaceLiveCoordinatorTests
     }
 
     [Test]
+    public async Task Real_final_only_cfm_disable_enable_keeps_immutable_snapshot_without_replay ()
+    {
+        const string firstJson = "{\"type\":\"CYCLE\",\"sessionId\":\"cfm-immutable\",\"sequence\":1,\"timestampEpochMillis\":1790181663412}";
+        const string secondJson = "{\"type\":\"CYCLE\",\"sessionId\":\"cfm-immutable\",\"sequence\":2,\"timestampEpochMillis\":1790181663413}";
+        string finalPath = CreateFile("cactusmonitor/sessions/cfm-immutable.jsonl", firstJson + "\n" + secondJson + "\n");
+        var factory = new RecordingRealSessionFactory(PluginRegistry.PluginRegistry.Instance, new EncodingOptions { Encoding = Utf8 }, 256);
+        using var coordinator = new MinecraftWorkspaceLiveCoordinator(CreateDiscovery(), factory);
+        coordinator.Reconcile();
+        await WaitUntil(() => coordinator.PendingCount == 2 && coordinator.GetRuntimeSources().Any(state =>
+            state.Source.FullPath == finalPath && state.Status == MinecraftWorkspaceSourceStatus.ImmutableComplete),
+            "Initial final-only CFM snapshot did not complete").ConfigureAwait(false);
+
+        IReadOnlyList<MinecraftWorkspaceIngressEvent> initial = coordinator.DrainPendingEvents();
+        DiscoveredSourceFile source = GetSource(finalPath);
+        coordinator.SetSourceEnabled(source.SourceId, enabled: false);
+        MinecraftWorkspaceLogicalSourceSnapshot disabled = coordinator.GetLogicalSourceSnapshot().Single();
+
+        coordinator.SetSourceEnabled(source.SourceId, enabled: true);
+        MinecraftWorkspaceLogicalSourceSnapshot enabled = coordinator.GetLogicalSourceSnapshot().Single();
+        IReadOnlyList<MinecraftWorkspaceIngressEvent> afterReenable = coordinator.DrainPendingEvents();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(initial.Select(item => item.Event.RawText), Is.EqualTo(new[] { firstJson, secondJson }));
+            Assert.That(disabled.IsEnabled, Is.False);
+            Assert.That(disabled.Status, Is.EqualTo(MinecraftWorkspaceSourceStatus.Disabled));
+            Assert.That(disabled.Segments.Single().Status, Is.EqualTo(MinecraftWorkspaceSourceStatus.Disabled));
+            Assert.That(disabled.Segments.Single().EmittedEventCount, Is.EqualTo(2));
+            Assert.That(disabled.HasResumeCheckpoint, Is.False);
+            Assert.That(factory.CreatedRequests, Has.Count.EqualTo(1), "An unchanged immutable segment must not create another reader.");
+            Assert.That(factory.CreatedRequests.Single().Path, Is.EqualTo(finalPath));
+            Assert.That(factory.CreatedRequests.Single().Request.StartByteOffset, Is.Zero,
+                "Only the original immutable snapshot may start at byte zero.");
+            Assert.That(afterReenable, Is.Empty, "Re-enabling an unchanged immutable segment must not duplicate ingress events.");
+            Assert.That(enabled.IsEnabled, Is.True);
+            Assert.That(enabled.Status, Is.EqualTo(MinecraftWorkspaceSourceStatus.ImmutableComplete));
+            Assert.That(enabled.Segments.Single().Status, Is.EqualTo(MinecraftWorkspaceSourceStatus.ImmutableComplete));
+            Assert.That(enabled.Segments.Single().EmittedEventCount, Is.EqualTo(2));
+            Assert.That(FindState(coordinator, finalPath).NextSourceLocalSequence, Is.EqualTo(3));
+        });
+    }
+
+    [Test]
+    public async Task Real_rotated_only_yeezus_disable_enable_keeps_immutable_snapshot_without_replay ()
+    {
+        const string first = "2026-09-28T09:57:00Z [INFO] [yeezus-core] [Client thread] rotated history one";
+        const string second = "2026-09-28T09:58:00Z [INFO] [yeezus-core] [Client thread] rotated history two";
+        string rotatedPath = CreateFile("logs/yeezus.log.1", first + "\n" + second + "\n");
+        var factory = new RecordingRealSessionFactory(PluginRegistry.PluginRegistry.Instance, new EncodingOptions { Encoding = Utf8 }, 256);
+        using var coordinator = new MinecraftWorkspaceLiveCoordinator(CreateDiscovery(), factory);
+        coordinator.Reconcile();
+        await WaitUntil(() => coordinator.PendingCount == 2 && coordinator.GetRuntimeSources().Any(state =>
+            state.Source.FullPath == rotatedPath && state.Status == MinecraftWorkspaceSourceStatus.ImmutableComplete),
+            "Initial rotated-only Yeezus snapshot did not complete").ConfigureAwait(false);
+
+        IReadOnlyList<MinecraftWorkspaceIngressEvent> initial = coordinator.DrainPendingEvents();
+        DiscoveredSourceFile source = GetSource(rotatedPath);
+        coordinator.SetSourceEnabled(source.SourceId, enabled: false);
+        MinecraftWorkspaceLogicalSourceSnapshot disabled = coordinator.GetLogicalSourceSnapshot().Single();
+
+        coordinator.SetSourceEnabled(source.SourceId, enabled: true);
+        MinecraftWorkspaceLogicalSourceSnapshot enabled = coordinator.GetLogicalSourceSnapshot().Single();
+        IReadOnlyList<MinecraftWorkspaceIngressEvent> afterReenable = coordinator.DrainPendingEvents();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(initial.Select(item => item.Event.Message), Is.EqualTo(new[] { "rotated history one", "rotated history two" }));
+            Assert.That(disabled.IsEnabled, Is.False);
+            Assert.That(disabled.Status, Is.EqualTo(MinecraftWorkspaceSourceStatus.Disabled));
+            Assert.That(disabled.Segments.Single().Status, Is.EqualTo(MinecraftWorkspaceSourceStatus.Disabled));
+            Assert.That(disabled.Segments.Single().EmittedEventCount, Is.EqualTo(2));
+            Assert.That(factory.CreatedRequests, Has.Count.EqualTo(1), "An unchanged rotated immutable segment must not create another reader.");
+            Assert.That(factory.CreatedRequests.Single().Path, Is.EqualTo(rotatedPath));
+            Assert.That(factory.CreatedRequests.Single().Request.StartByteOffset, Is.Zero,
+                "Only the original immutable snapshot may start at byte zero.");
+            Assert.That(afterReenable, Is.Empty, "Re-enabling an unchanged rotated segment must not duplicate ingress events.");
+            Assert.That(enabled.IsEnabled, Is.True);
+            Assert.That(enabled.Status, Is.EqualTo(MinecraftWorkspaceSourceStatus.ImmutableComplete));
+            Assert.That(enabled.Segments.Single().Status, Is.EqualTo(MinecraftWorkspaceSourceStatus.ImmutableComplete));
+            Assert.That(enabled.Segments.Single().EmittedEventCount, Is.EqualTo(2));
+            Assert.That(FindState(coordinator, rotatedPath).NextSourceLocalSequence, Is.EqualTo(3));
+        });
+    }
+
+    [Test]
     public async Task Real_yeezus_disabled_rotation_replays_old_primary_and_starts_new_primary_once ()
     {
         const string historyOne = "2026-09-28T09:57:00Z [INFO] [yeezus-core] [Client thread] history one";
