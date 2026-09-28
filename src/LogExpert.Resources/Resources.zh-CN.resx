@@ -2276,4 +2276,13 @@ YY[YY] = 年
   <data name="MinecraftWorkspace_Live_Paused" xml:space="preserve">
     <value>已暂停 · 待处理: {0}</value>
   </data>
+  <data name="MinecraftWorkspace_Sources_Tab" xml:space="preserve"><value>实时来源</value></data>
+  <data name="MinecraftWorkspace_Sources_Explanation" xml:space="preserve"><value>控制实时采集。来源筛选器仅筛选时间线中已有的事件。</value></data>
+  <data name="MinecraftWorkspace_Sources_Rescan" xml:space="preserve"><value>重新扫描</value></data>
+  <data name="MinecraftWorkspace_Sources_Tooltip" xml:space="preserve"><value>启用或停用每个逻辑来源的实时采集。</value></data>
+  <data name="MinecraftWorkspace_Sources_Enabled" xml:space="preserve"><value>已启用</value></data>
+  <data name="MinecraftWorkspace_Sources_Disabled" xml:space="preserve"><value>已停用</value></data>
+  <data name="LogTabWindow_RecentMinecraftWorkspaces" xml:space="preserve"><value>最近的 Minecraft 工作区</value></data>
+  <data name="LogTabWindow_RemoveRecentMinecraftWorkspace" xml:space="preserve"><value>从最近工作区中移除</value></data>
+  <data name="LogTabWindow_NoRecentMinecraftWorkspaces" xml:space="preserve"><value>没有最近的 Minecraft 工作区</value></data>
 </root>

@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Runtime.Versioning;
 using System.Text;
 
@@ -41,6 +42,22 @@ internal interface IMinecraftWorkspaceHostRuntime : IDisposable
 internal interface IMinecraftWorkspaceHostRuntimeFactory
 {
     IMinecraftWorkspaceHostRuntime Create (string rootPath);
+}
+
+[SupportedOSPlatform("windows")]
+internal interface IMinecraftWorkspaceHostRuntimeFactoryWithSourcePolicy
+{
+    IMinecraftWorkspaceHostRuntime Create (string rootPath, IReadOnlyList<string> initiallyDisabledSourceIds);
+}
+
+[SupportedOSPlatform("windows")]
+internal interface IMinecraftWorkspaceHostSourceManagement
+{
+    string WorkspaceId { get; }
+
+    IReadOnlyList<MinecraftWorkspaceLogicalSourceSnapshot> GetLogicalSourceSnapshot ();
+
+    void SetSourceEnabled (string sourceId, bool enabled);
 }
 
 [SupportedOSPlatform("windows")]
@@ -123,7 +140,9 @@ internal sealed class WinFormsMinecraftWorkspaceHostDispatcher (Control owner) :
 }
 
 [SupportedOSPlatform("windows")]
-internal sealed class MinecraftWorkspaceHostRuntimeFactory : IMinecraftWorkspaceHostRuntimeFactory
+internal sealed class MinecraftWorkspaceHostRuntimeFactory :
+    IMinecraftWorkspaceHostRuntimeFactory,
+    IMinecraftWorkspaceHostRuntimeFactoryWithSourcePolicy
 {
     private readonly IPluginRegistry _pluginRegistry;
     private readonly int _maximumLineLength;
@@ -137,6 +156,9 @@ internal sealed class MinecraftWorkspaceHostRuntimeFactory : IMinecraftWorkspace
     }
 
     public IMinecraftWorkspaceHostRuntime Create (string rootPath)
+        => Create(rootPath, []);
+
+    public IMinecraftWorkspaceHostRuntime Create (string rootPath, IReadOnlyList<string> initiallyDisabledSourceIds)
     {
         MinecraftWorkspace workspace = new(rootPath);
         MinecraftSourceDiscovery discovery = new(workspace);
@@ -144,13 +166,16 @@ internal sealed class MinecraftWorkspaceHostRuntimeFactory : IMinecraftWorkspace
             _pluginRegistry,
             new EncodingOptions { Encoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false) },
             _maximumLineLength);
-        MinecraftWorkspaceLiveCoordinator coordinator = new(discovery, sessionFactory);
+        MinecraftWorkspaceLiveCoordinator coordinator = new(
+            discovery,
+            sessionFactory,
+            initiallyDisabledSourceIds: initiallyDisabledSourceIds);
         return new MinecraftWorkspaceHostRuntime(workspace, discovery, sessionFactory, coordinator);
     }
 }
 
 [SupportedOSPlatform("windows")]
-internal sealed class MinecraftWorkspaceHostRuntime : IMinecraftWorkspaceHostRuntime
+internal sealed class MinecraftWorkspaceHostRuntime : IMinecraftWorkspaceHostRuntime, IMinecraftWorkspaceHostSourceManagement
 {
     private readonly MinecraftWorkspaceTimeline _timeline;
     private readonly MinecraftWorkspaceTimelineFilter _filter = new();
@@ -183,6 +208,12 @@ internal sealed class MinecraftWorkspaceHostRuntime : IMinecraftWorkspaceHostRun
     public MinecraftWorkspaceLiveCoordinator Coordinator { get; }
 
     public string DisplayName { get; }
+
+    public string WorkspaceId => Workspace.WorkspaceId;
+
+    public IReadOnlyList<MinecraftWorkspaceLogicalSourceSnapshot> GetLogicalSourceSnapshot () => Coordinator.GetLogicalSourceSnapshot();
+
+    public void SetSourceEnabled (string sourceId, bool enabled) => Coordinator.SetSourceEnabled(sourceId, enabled);
 
     public MinecraftWorkspaceReadOnlyViewSnapshot Refresh (MinecraftWorkspaceTimelineFilterQuery query)
     {
@@ -221,6 +252,7 @@ internal sealed class MinecraftWorkspaceHostController : IDisposable
     private readonly IMinecraftWorkspaceHostDispatcher _dispatcher;
     private readonly Action<Exception> _showError;
     private readonly IMinecraftWorkspaceSourceNavigator? _sourceNavigator;
+    private readonly MinecraftWorkspaceSettingsStore? _settingsStore;
     private readonly object _gate = new();
     private MinecraftWorkspaceHostSession? _activeSession;
     private int _disposed;
@@ -233,7 +265,8 @@ internal sealed class MinecraftWorkspaceHostController : IDisposable
         Func<IMinecraftWorkspaceRefreshTrigger> triggerFactory,
         IMinecraftWorkspaceHostDispatcher dispatcher,
         Action<Exception> showError,
-        IMinecraftWorkspaceSourceNavigator? sourceNavigator = null)
+        IMinecraftWorkspaceSourceNavigator? sourceNavigator = null,
+        IConfigManager? configManager = null)
     {
         _owner = owner ?? throw new ArgumentNullException(nameof(owner));
         _dockPanel = dockPanel ?? throw new ArgumentNullException(nameof(dockPanel));
@@ -243,6 +276,17 @@ internal sealed class MinecraftWorkspaceHostController : IDisposable
         _dispatcher = dispatcher ?? throw new ArgumentNullException(nameof(dispatcher));
         _showError = showError ?? throw new ArgumentNullException(nameof(showError));
         _sourceNavigator = sourceNavigator;
+        _settingsStore = configManager is null ? null : new MinecraftWorkspaceSettingsStore(configManager);
+    }
+
+    public event EventHandler? RecentWorkspacesChanged;
+
+    public IReadOnlyList<string> GetRecentWorkspaceRoots () => _settingsStore?.GetRecentWorkspaceRoots() ?? Array.Empty<string>();
+
+    public void RemoveRecentWorkspace (string rootPath)
+    {
+        _settingsStore?.RemoveRecentWorkspace(rootPath);
+        RecentWorkspacesChanged?.Invoke(this, EventArgs.Empty);
     }
 
     public MinecraftWorkspaceReadOnlyDocument? ActiveDocument
@@ -327,7 +371,10 @@ internal sealed class MinecraftWorkspaceHostController : IDisposable
         Exception? failure = null;
         try
         {
-            runtime = _runtimeFactory.Create(rootPath);
+            IReadOnlyList<string> disabledSources = _settingsStore?.GetDisabledSourceIds(rootPath) ?? Array.Empty<string>();
+            runtime = _runtimeFactory is IMinecraftWorkspaceHostRuntimeFactoryWithSourcePolicy sourcePolicyFactory
+                ? sourcePolicyFactory.Create(rootPath, disabledSources)
+                : _runtimeFactory.Create(rootPath);
             snapshot = runtime.Refresh(new MinecraftWorkspaceTimelineFilterQuery());
         }
         catch (Exception exception)
@@ -340,7 +387,7 @@ internal sealed class MinecraftWorkspaceHostController : IDisposable
         IMinecraftWorkspaceHostRuntime? preparedRuntime = runtime;
         MinecraftWorkspaceReadOnlyViewSnapshot? initialSnapshot = snapshot;
         Exception? openFailure = failure;
-        if (!_dispatcher.TryPostToUi(() => CompleteCandidate(preparedRuntime, initialSnapshot, openFailure, completion)))
+        if (!_dispatcher.TryPostToUi(() => CompleteCandidate(rootPath, preparedRuntime, initialSnapshot, openFailure, completion)))
         {
             preparedRuntime?.Dispose();
             completion.TrySetResult(false);
@@ -348,6 +395,7 @@ internal sealed class MinecraftWorkspaceHostController : IDisposable
     }
 
     private void CompleteCandidate (
+        string rootPath,
         IMinecraftWorkspaceHostRuntime? runtime,
         MinecraftWorkspaceReadOnlyViewSnapshot? snapshot,
         Exception? failure,
@@ -379,7 +427,13 @@ internal sealed class MinecraftWorkspaceHostController : IDisposable
                 _dispatcher,
                 session => IsCurrentSession(session),
                 OnDocumentClosed,
-                _sourceNavigator);
+                _sourceNavigator,
+                _settingsStore,
+                _showError);
+            if (runtime is IMinecraftWorkspaceHostSourceManagement sourceManagement)
+            {
+                document.WorkspaceControl.ApplyLogicalSourceSnapshot(sourceManagement.GetLogicalSourceSnapshot());
+            }
             document.Show(_dockPanel, DockState.Document);
 
             MinecraftWorkspaceHostSession? previous;
@@ -398,6 +452,18 @@ internal sealed class MinecraftWorkspaceHostController : IDisposable
 
             previous?.Dispose(closeDocument: true);
             candidate.Activate();
+            if (_settingsStore is not null)
+            {
+                try
+                {
+                    _settingsStore.RecordSuccessfulOpen(rootPath);
+                    RecentWorkspacesChanged?.Invoke(this, EventArgs.Empty);
+                }
+                catch (Exception exception)
+                {
+                    _showError(exception);
+                }
+            }
             completion.TrySetResult(true);
         }
         catch (Exception exception)
@@ -457,7 +523,10 @@ internal sealed class MinecraftWorkspaceHostSession : IDisposable
     private readonly Func<MinecraftWorkspaceHostSession, bool> _isCurrent;
     private readonly Action<MinecraftWorkspaceHostSession> _documentClosed;
     private readonly IMinecraftWorkspaceSourceNavigator? _sourceNavigator;
+    private readonly MinecraftWorkspaceSettingsStore? _settingsStore;
+    private readonly Action<Exception> _showError;
     private readonly object _gate = new();
+    private readonly object _sourcePolicyGate = new();
     private bool _refreshRunning;
     private bool _refreshPending;
     private bool _paused;
@@ -467,6 +536,7 @@ internal sealed class MinecraftWorkspaceHostSession : IDisposable
     private long _pausedSnapshotRevision;
     private long? _allowPausedApplyRevision;
     private long _sourceNavigationRevision;
+    private readonly ConcurrentDictionary<string, long> _sourcePolicyRevisions = new(StringComparer.Ordinal);
     private int _disposed;
 
     public MinecraftWorkspaceHostSession (
@@ -476,7 +546,9 @@ internal sealed class MinecraftWorkspaceHostSession : IDisposable
         IMinecraftWorkspaceHostDispatcher dispatcher,
         Func<MinecraftWorkspaceHostSession, bool> isCurrent,
         Action<MinecraftWorkspaceHostSession> documentClosed,
-        IMinecraftWorkspaceSourceNavigator? sourceNavigator)
+        IMinecraftWorkspaceSourceNavigator? sourceNavigator,
+        MinecraftWorkspaceSettingsStore? settingsStore,
+        Action<Exception> showError)
     {
         _runtime = runtime;
         Document = document;
@@ -485,10 +557,14 @@ internal sealed class MinecraftWorkspaceHostSession : IDisposable
         _isCurrent = isCurrent;
         _documentClosed = documentClosed;
         _sourceNavigator = sourceNavigator;
+        _settingsStore = settingsStore;
+        _showError = showError;
         _currentQuery = Document.WorkspaceControl.Snapshot.QuerySnapshot;
         Document.FormClosed += OnDocumentFormClosed;
         Document.WorkspaceControl.FilterQueryChanged += OnFilterQueryChanged;
         Document.WorkspaceControl.PauseChanged += OnPauseChanged;
+        Document.WorkspaceControl.LiveSourceEnabledChanged += OnLiveSourceEnabledChanged;
+        Document.WorkspaceControl.RescanRequested += OnRescanRequested;
         if (_sourceNavigator != null)
         {
             Document.WorkspaceControl.ShowInSourceRequested += OnShowInSourceRequested;
@@ -531,6 +607,8 @@ internal sealed class MinecraftWorkspaceHostSession : IDisposable
         _trigger.Dispose();
         Document.WorkspaceControl.FilterQueryChanged -= OnFilterQueryChanged;
         Document.WorkspaceControl.PauseChanged -= OnPauseChanged;
+        Document.WorkspaceControl.LiveSourceEnabledChanged -= OnLiveSourceEnabledChanged;
+        Document.WorkspaceControl.RescanRequested -= OnRescanRequested;
         if (_sourceNavigator != null)
         {
             Document.WorkspaceControl.ShowInSourceRequested -= OnShowInSourceRequested;
@@ -553,6 +631,80 @@ internal sealed class MinecraftWorkspaceHostSession : IDisposable
     }
 
     private void OnTriggerTick (object? sender, EventArgs e) => RequestRefresh();
+
+    private void OnRescanRequested (object? sender, EventArgs e) => RequestRefresh();
+
+    private void OnLiveSourceEnabledChanged (object? sender, MinecraftWorkspaceSourceEnabledChangedEventArgs e)
+    {
+        long revision = _sourcePolicyRevisions.AddOrUpdate(e.SourceId, 1, (_, current) => checked(current + 1));
+        try
+        {
+            _dispatcher.QueueBackgroundWork(() => SetSourceEnabled(e.SourceId, e.IsEnabled, revision));
+        }
+        catch (Exception exception)
+        {
+            ClearPendingSourceChange(e.SourceId, exception);
+        }
+    }
+
+    private void SetSourceEnabled (string sourceId, bool enabled, long revision)
+    {
+        lock (_sourcePolicyGate)
+        {
+            if (Volatile.Read(ref _disposed) != 0 ||
+                !_sourcePolicyRevisions.TryGetValue(sourceId, out long currentRevision) ||
+                revision != currentRevision ||
+                !_isCurrent(this))
+            {
+                return;
+            }
+
+            if (_runtime is not IMinecraftWorkspaceHostSourceManagement sourceManagement)
+            {
+                ClearPendingSourceChange(sourceId, new InvalidOperationException());
+                return;
+            }
+
+            MinecraftWorkspaceLogicalSourceSnapshot? current = sourceManagement.GetLogicalSourceSnapshot()
+                .FirstOrDefault(source => source.SourceId == sourceId);
+            bool previousEnabled = current?.IsEnabled ?? !enabled;
+            try
+            {
+                _settingsStore?.SetSourceEnabledForWorkspaceId(sourceManagement.WorkspaceId, sourceId, enabled);
+                sourceManagement.SetSourceEnabled(sourceId, enabled);
+                RequestRefresh();
+            }
+            catch (Exception exception)
+            {
+                try
+                {
+                    _settingsStore?.SetSourceEnabledForWorkspaceId(sourceManagement.WorkspaceId, sourceId, previousEnabled);
+                }
+                catch (Exception rollbackException)
+                {
+                    Logger.Error(rollbackException, "Could not restore Minecraft workspace source policy after a failed toggle.");
+                }
+
+                ClearPendingSourceChange(sourceId, exception);
+            }
+        }
+    }
+
+    private void ClearPendingSourceChange (string sourceId, Exception exception)
+    {
+        _ = _dispatcher.TryPostToUi(() =>
+        {
+            if (Volatile.Read(ref _disposed) != 0 || !_isCurrent(this) || Document.IsDisposed || Document.WorkspaceControl.IsDisposed)
+            {
+                return;
+            }
+
+            IReadOnlyList<MinecraftWorkspaceLogicalSourceSnapshot> sources =
+                (_runtime as IMinecraftWorkspaceHostSourceManagement)?.GetLogicalSourceSnapshot() ?? Array.Empty<MinecraftWorkspaceLogicalSourceSnapshot>();
+            Document.WorkspaceControl.ApplyLogicalSourceSnapshot(sources, clearPendingSourceId: sourceId);
+            _showError(exception);
+        });
+    }
 
     private void OnShowInSourceRequested (object? sender, MinecraftWorkspaceShowInSourceEventArgs e)
     {
@@ -776,11 +928,13 @@ internal sealed class MinecraftWorkspaceHostSession : IDisposable
         }
 
         MinecraftWorkspaceReadOnlyViewSnapshot? snapshot = null;
+        IReadOnlyList<MinecraftWorkspaceLogicalSourceSnapshot> sources = Array.Empty<MinecraftWorkspaceLogicalSourceSnapshot>();
         if (Volatile.Read(ref _disposed) == 0)
         {
             try
             {
                 snapshot = _runtime.Refresh(query);
+                sources = (_runtime as IMinecraftWorkspaceHostSourceManagement)?.GetLogicalSourceSnapshot() ?? sources;
             }
             catch (Exception exception)
             {
@@ -790,7 +944,7 @@ internal sealed class MinecraftWorkspaceHostSession : IDisposable
 
         if (snapshot != null && Volatile.Read(ref _disposed) == 0)
         {
-            _ = _dispatcher.TryPostToUi(() => ApplySnapshotIfCurrent(snapshot, queryRevision));
+            _ = _dispatcher.TryPostToUi(() => ApplySnapshotIfCurrent(snapshot, sources, queryRevision));
         }
 
         bool runCoalescedRefresh;
@@ -817,7 +971,10 @@ internal sealed class MinecraftWorkspaceHostSession : IDisposable
         }
     }
 
-    private void ApplySnapshotIfCurrent (MinecraftWorkspaceReadOnlyViewSnapshot snapshot, long queryRevision)
+    private void ApplySnapshotIfCurrent (
+        MinecraftWorkspaceReadOnlyViewSnapshot snapshot,
+        IReadOnlyList<MinecraftWorkspaceLogicalSourceSnapshot> sources,
+        long queryRevision)
     {
         lock (_gate)
         {
@@ -861,6 +1018,7 @@ internal sealed class MinecraftWorkspaceHostSession : IDisposable
 
         if (!applySnapshot)
         {
+            Document.WorkspaceControl.ApplyLogicalSourceSnapshot(sources);
             Document.WorkspaceControl.SetPaused(isPaused: true, backlogCount);
             return;
         }
@@ -868,6 +1026,7 @@ internal sealed class MinecraftWorkspaceHostSession : IDisposable
         try
         {
             Document.WorkspaceControl.ApplySnapshot(snapshot);
+            Document.WorkspaceControl.ApplyLogicalSourceSnapshot(sources);
             if (Document.WorkspaceControl.IsPaused)
             {
                 Document.WorkspaceControl.SetPaused(isPaused: true, backlogCount: 0);

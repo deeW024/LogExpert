@@ -2382,4 +2382,13 @@ LogExpert neu starten, um die Änderungen zu übernehmen?</value>
   <data name="MinecraftWorkspace_Live_Paused" xml:space="preserve">
     <value>Angehalten · Rückstand: {0}</value>
   </data>
+  <data name="MinecraftWorkspace_Sources_Tab" xml:space="preserve"><value>Live-Quellen</value></data>
+  <data name="MinecraftWorkspace_Sources_Explanation" xml:space="preserve"><value>Steuert die Live-Erfassung. Das Quellen-Facet filtert nur bereits geladene Ereignisse.</value></data>
+  <data name="MinecraftWorkspace_Sources_Rescan" xml:space="preserve"><value>Erneut suchen</value></data>
+  <data name="MinecraftWorkspace_Sources_Tooltip" xml:space="preserve"><value>Live-Erfassung für jede logische Quelle aktivieren oder deaktivieren.</value></data>
+  <data name="MinecraftWorkspace_Sources_Enabled" xml:space="preserve"><value>Aktiviert</value></data>
+  <data name="MinecraftWorkspace_Sources_Disabled" xml:space="preserve"><value>Deaktiviert</value></data>
+  <data name="LogTabWindow_RecentMinecraftWorkspaces" xml:space="preserve"><value>Zuletzt verwendete Minecraft-Arbeitsbereiche</value></data>
+  <data name="LogTabWindow_RemoveRecentMinecraftWorkspace" xml:space="preserve"><value>Aus zuletzt verwendeten Arbeitsbereichen entfernen</value></data>
+  <data name="LogTabWindow_NoRecentMinecraftWorkspaces" xml:space="preserve"><value>Keine zuletzt verwendeten Minecraft-Arbeitsbereiche</value></data>
 </root>

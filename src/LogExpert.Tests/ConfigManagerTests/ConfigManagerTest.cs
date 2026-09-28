@@ -872,6 +872,23 @@ public class ConfigManagerTest
 
     [Test]
     [Category("Integration")]
+    [Description("Legacy settings without Minecraft workspace properties receive safe defaults")]
+    public void InitializeSettings_LegacyJsonDefaultsWorkspaceHistoryAndPoliciesWithoutChangingFileHistory ()
+    {
+        Settings legacySettings = JsonConvert.DeserializeObject<Settings>("{ \"FileHistoryList\": [\"ordinary.log\"] }")!;
+
+        Settings initialized = InvokePrivateStaticMethod<Settings>("InitializeSettings", legacySettings);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(initialized.RecentMinecraftWorkspaceRoots, Is.Not.Null.And.Empty);
+            Assert.That(initialized.MinecraftWorkspaceSourcePolicies, Is.Not.Null.And.Empty);
+            Assert.That(initialized.FileHistoryList, Is.EqualTo(new[] { "ordinary.log" }));
+        });
+    }
+
+    [Test]
+    [Category("Integration")]
     [Description("Multiple save operations should maintain backup chain correctly")]
     public void MultipleSaves_MaintainsBackupChain ()
     {

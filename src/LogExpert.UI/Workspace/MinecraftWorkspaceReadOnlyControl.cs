@@ -24,6 +24,8 @@ public sealed class MinecraftWorkspaceReadOnlyControl : UserControl
     private readonly Button _pauseButton;
     private readonly Label _liveStateLabel;
     private readonly TabControl _facetTabs;
+    private readonly CheckedListBox _liveSourceList;
+    private readonly Button _rescanSourcesButton;
     private readonly CheckedListBox _fileFacetList;
     private readonly CheckedListBox _sourceFacetList;
     private readonly CheckedListBox _componentFacetList;
@@ -34,6 +36,8 @@ public sealed class MinecraftWorkspaceReadOnlyControl : UserControl
     private readonly Button _showInSourceButton;
     private readonly Label _sourceNavigationStatusLabel;
     private readonly HashSet<string> _selectedFileIds = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, bool> _pendingSourceEnablement = new(StringComparer.Ordinal);
+    private IReadOnlyList<MinecraftWorkspaceLogicalSourceSnapshot> _logicalSources = Array.Empty<MinecraftWorkspaceLogicalSourceSnapshot>();
     private HashSet<MinecraftWorkspaceFacetValue<string>> _selectedSources = [];
     private HashSet<MinecraftWorkspaceFacetValue<string>> _selectedComponents = [];
     private HashSet<MinecraftWorkspaceFacetValue<LogLevel>> _selectedLevels = [];
@@ -145,6 +149,45 @@ public sealed class MinecraftWorkspaceReadOnlyControl : UserControl
         AddFacetTab("Component", _componentFacetList);
         AddFacetTab("Level", _levelFacetList);
         AddFacetTab("Thread", _threadFacetList);
+
+        _liveSourceList = new CheckedListBox
+        {
+            Name = "WorkspaceLiveSources",
+            Dock = DockStyle.Fill,
+            CheckOnClick = true,
+            IntegralHeight = false,
+            HorizontalScrollbar = true,
+            AccessibleDescription = "Controls live source ingestion. The Source facet only filters events already in the timeline."
+        };
+        Label sourceControlExplanation = new()
+        {
+            Name = "WorkspaceLiveSourcesExplanation",
+            Dock = DockStyle.Top,
+            Height = 42,
+            Text = Resources.ResourceManager.GetString("MinecraftWorkspace_Sources_Explanation", CultureInfo.CurrentUICulture)!,
+            AutoEllipsis = true,
+            Padding = new Padding(4)
+        };
+        _rescanSourcesButton = new Button
+        {
+            Name = "WorkspaceRescanSources",
+            Text = Resources.ResourceManager.GetString("MinecraftWorkspace_Sources_Rescan", CultureInfo.CurrentUICulture)!,
+            AutoSize = true
+        };
+        FlowLayoutPanel sourceActions = new() { Dock = DockStyle.Top, Height = 34, Padding = new Padding(4, 2, 2, 2) };
+        sourceActions.Controls.Add(_rescanSourcesButton);
+        Panel liveSourcesPane = new() { Dock = DockStyle.Fill };
+        liveSourcesPane.Controls.Add(_liveSourceList);
+        liveSourcesPane.Controls.Add(sourceActions);
+        liveSourcesPane.Controls.Add(sourceControlExplanation);
+        _facetTabs.TabPages.Add(new TabPage(
+            Resources.ResourceManager.GetString("MinecraftWorkspace_Sources_Tab", CultureInfo.CurrentUICulture)!)
+        {
+            Name = "WorkspaceLiveSourcesTab",
+            Padding = new Padding(0),
+            ToolTipText = Resources.ResourceManager.GetString("MinecraftWorkspace_Sources_Tooltip", CultureInfo.CurrentUICulture),
+            Controls = { liveSourcesPane }
+        });
 
         _eventGrid = CreateGrid();
         _showInSourceButton = new Button
@@ -259,6 +302,8 @@ public sealed class MinecraftWorkspaceReadOnlyControl : UserControl
         _componentFacetList.ItemCheck += (_, e) => OnFacetItemCheck(_componentFacetList, _selectedComponents, e);
         _levelFacetList.ItemCheck += (_, e) => OnFacetItemCheck(_levelFacetList, _selectedLevels, e);
         _threadFacetList.ItemCheck += (_, e) => OnFacetItemCheck(_threadFacetList, _selectedThreads, e);
+        _liveSourceList.ItemCheck += OnLiveSourceItemCheck;
+        _rescanSourcesButton.Click += (_, _) => RescanRequested?.Invoke(this, EventArgs.Empty);
 
         ApplySnapshot(snapshot);
     }
@@ -268,6 +313,10 @@ public sealed class MinecraftWorkspaceReadOnlyControl : UserControl
     public event EventHandler<MinecraftWorkspaceShowInSourceEventArgs>? ShowInSourceRequested;
 
     public event EventHandler? PauseChanged;
+
+    public event EventHandler<MinecraftWorkspaceSourceEnabledChangedEventArgs>? LiveSourceEnabledChanged;
+
+    public event EventHandler? RescanRequested;
 
     public MinecraftWorkspaceReadOnlyViewSnapshot Snapshot => _snapshot;
 
@@ -296,6 +345,12 @@ public sealed class MinecraftWorkspaceReadOnlyControl : UserControl
     public int BacklogCount { get; private set; }
 
     public TabControl FacetTabs => _facetTabs;
+
+    public CheckedListBox LiveSourceList => _liveSourceList;
+
+    public Button RescanSourcesButton => _rescanSourcesButton;
+
+    public IReadOnlyList<MinecraftWorkspaceLogicalSourceSnapshot> LogicalSources => _logicalSources;
 
     public CheckedListBox FileFacetList => _fileFacetList;
 
@@ -327,6 +382,66 @@ public sealed class MinecraftWorkspaceReadOnlyControl : UserControl
     {
         VerifyUiThread();
         _sourceNavigationStatusLabel.Text = status ?? string.Empty;
+    }
+
+    public void ApplyLogicalSourceSnapshot (
+        IReadOnlyList<MinecraftWorkspaceLogicalSourceSnapshot> sources,
+        string? clearPendingSourceId = null)
+    {
+        ArgumentNullException.ThrowIfNull(sources);
+        VerifyUiThread();
+        _logicalSources = Array.AsReadOnly(sources.ToArray());
+        if (clearPendingSourceId is not null)
+        {
+            _pendingSourceEnablement.Remove(clearPendingSourceId);
+        }
+
+        HashSet<string> presentIds = _logicalSources.Select(source => source.SourceId).ToHashSet(StringComparer.Ordinal);
+        foreach (string staleSourceId in _pendingSourceEnablement.Keys.Where(sourceId => !presentIds.Contains(sourceId)).ToArray())
+        {
+            _pendingSourceEnablement.Remove(staleSourceId);
+        }
+
+        _liveSourceList.BeginUpdate();
+        _synchronizingSourceList = true;
+        try
+        {
+            _liveSourceList.Items.Clear();
+            foreach (MinecraftWorkspaceLogicalSourceSnapshot source in _logicalSources)
+            {
+                if (_pendingSourceEnablement.TryGetValue(source.SourceId, out bool requestedEnabled) && requestedEnabled == source.IsEnabled)
+                {
+                    _pendingSourceEnablement.Remove(source.SourceId);
+                }
+
+                var item = new MinecraftWorkspaceLogicalSourceEditorItem(source);
+                int index = _liveSourceList.Items.Add(item);
+                bool enabled = _pendingSourceEnablement.TryGetValue(source.SourceId, out requestedEnabled)
+                    ? requestedEnabled
+                    : source.IsEnabled;
+                _liveSourceList.SetItemChecked(index, enabled);
+            }
+        }
+        finally
+        {
+            _synchronizingSourceList = false;
+            _liveSourceList.EndUpdate();
+        }
+    }
+
+    private bool _synchronizingSourceList;
+
+    private void OnLiveSourceItemCheck (object? sender, ItemCheckEventArgs e)
+    {
+        if (_synchronizingSourceList || e.Index < 0 || e.Index >= _liveSourceList.Items.Count ||
+            _liveSourceList.Items[e.Index] is not MinecraftWorkspaceLogicalSourceEditorItem item)
+        {
+            return;
+        }
+
+        bool enabled = e.NewValue == CheckState.Checked;
+        _pendingSourceEnablement[item.Source.SourceId] = enabled;
+        LiveSourceEnabledChanged?.Invoke(this, new MinecraftWorkspaceSourceEnabledChangedEventArgs(item.Source.SourceId, enabled));
     }
 
     protected override bool ProcessCmdKey (ref Message msg, Keys keyData)
@@ -884,4 +999,28 @@ public sealed class MinecraftWorkspaceFilterQueryChangedEventArgs (MinecraftWork
 public sealed class MinecraftWorkspaceShowInSourceEventArgs (MinecraftWorkspaceTimelineEntry entry) : EventArgs
 {
     public MinecraftWorkspaceTimelineEntry Entry { get; } = entry ?? throw new ArgumentNullException(nameof(entry));
+}
+
+public sealed class MinecraftWorkspaceSourceEnabledChangedEventArgs (string sourceId, bool isEnabled) : EventArgs
+{
+    public string SourceId { get; } = sourceId ?? throw new ArgumentNullException(nameof(sourceId));
+
+    public bool IsEnabled { get; } = isEnabled;
+}
+
+public sealed class MinecraftWorkspaceLogicalSourceEditorItem (MinecraftWorkspaceLogicalSourceSnapshot source)
+{
+    public MinecraftWorkspaceLogicalSourceSnapshot Source { get; } = source ?? throw new ArgumentNullException(nameof(source));
+
+    public override string ToString ()
+    {
+        string enablement = Resources.ResourceManager.GetString(
+            Source.IsEnabled ? "MinecraftWorkspace_Sources_Enabled" : "MinecraftWorkspace_Sources_Disabled",
+            CultureInfo.CurrentUICulture) ?? (Source.IsEnabled ? "Enabled" : "Disabled");
+        string segments = string.Join("; ", Source.Segments.Select(segment =>
+            $"{segment.Source.RelativePath} · {segment.Status}{(segment.Reason is null ? string.Empty : $" · {segment.Reason}")}"));
+        return string.Create(
+            CultureInfo.CurrentCulture,
+            $"{Source.DisplayLabel} · {enablement} · {Source.Status} · {Source.EmittedEventCount} events · {segments}");
+    }
 }

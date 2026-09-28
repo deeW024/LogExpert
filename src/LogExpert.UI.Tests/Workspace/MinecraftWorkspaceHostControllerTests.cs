@@ -56,7 +56,9 @@ public sealed class MinecraftWorkspaceHostControllerTests
     public void Picker_cancel_leaves_workspace_and_unrelated_document_unchanged ()
     {
         FakeRuntimeFactory runtimeFactory = new();
-        _host = CreateHost(runtimeFactory, new FakePicker(null));
+        Settings settings = new();
+        Mock<IConfigManager> config = CreateConfig(settings);
+        _host = CreateHost(runtimeFactory, new FakePicker(null), configManager: config.Object);
         using DockContent unrelatedDocument = new() { Text = "Existing tab" };
         unrelatedDocument.Show(_host.DockPanel, DockState.Document);
 
@@ -70,22 +72,31 @@ public sealed class MinecraftWorkspaceHostControllerTests
             Assert.That(unrelatedDocument.IsDisposed, Is.False);
             Assert.That(unrelatedDocument.DockState, Is.EqualTo(DockState.Document));
             Assert.That(_host.Dispatcher.PendingBackground, Is.Zero);
+            Assert.That(settings.RecentMinecraftWorkspaceRoots, Is.Empty);
+            Assert.That(settings.FileHistoryList, Is.Empty);
         });
+        config.Verify(manager => manager.Save(SettingsFlags.Settings), Times.Never);
     }
 
     [Test]
     public void Invalid_candidate_keeps_current_workspace_and_existing_dock_document ()
     {
+        string firstRoot = Path.Combine(_testDirectory, "first");
+        string badRoot = Path.Combine(_testDirectory, "bad");
+        _ = Directory.CreateDirectory(firstRoot);
+        _ = Directory.CreateDirectory(badRoot);
         FakeRuntimeFactory runtimeFactory = new();
-        FakeRuntime firstRuntime = new("first", _ => Snapshot("First"));
-        runtimeFactory.CreateRuntime = path => path == "bad" ? throw new UnauthorizedAccessException("synthetic denied") : firstRuntime;
-        _host = CreateHost(runtimeFactory, new FakePicker(null));
+        Settings settings = new();
+        Mock<IConfigManager> config = CreateConfig(settings);
+        FakeRuntime firstRuntime = new(firstRoot, _ => Snapshot("First"));
+        runtimeFactory.CreateRuntime = path => path == badRoot ? throw new UnauthorizedAccessException("synthetic denied") : firstRuntime;
+        _host = CreateHost(runtimeFactory, new FakePicker(null), configManager: config.Object);
         using DockContent unrelatedDocument = new() { Text = "Normal log tab" };
         unrelatedDocument.Show(_host.DockPanel, DockState.Document);
-        OpenAndDrainInitialRefresh(_host, "first");
+        OpenAndDrainInitialRefresh(_host, firstRoot);
         MinecraftWorkspaceReadOnlyDocument current = _host.Controller.ActiveDocument!;
 
-        Task<bool> failedOpen = _host.Controller.OpenWorkspaceAsync("bad");
+        Task<bool> failedOpen = _host.Controller.OpenWorkspaceAsync(badRoot);
         _host.Dispatcher.RunNextBackground();
         _host.Dispatcher.RunNextUi();
 
@@ -98,6 +109,8 @@ public sealed class MinecraftWorkspaceHostControllerTests
             Assert.That(unrelatedDocument.DockState, Is.EqualTo(DockState.Document));
             Assert.That(firstRuntime.DisposeCount, Is.Zero);
             Assert.That(_host.Errors, Has.Count.EqualTo(1));
+            Assert.That(settings.RecentMinecraftWorkspaceRoots, Is.EqualTo(new[] { MinecraftWorkspaceSettingsStore.NormalizeRoot(firstRoot) }));
+            Assert.That(settings.FileHistoryList, Is.Empty);
         });
     }
 
@@ -128,6 +141,66 @@ public sealed class MinecraftWorkspaceHostControllerTests
             Assert.That(secondRuntime.DisposeCount, Is.Zero);
             Assert.That(runtimeFactory.CreatedPaths, Is.EqualTo(new[] { "first", "second" }));
             Assert.That(_host.Errors, Is.Empty);
+        });
+    }
+
+    [Test]
+    public void Successful_workspace_activation_records_normalized_recent_root_without_using_file_history ()
+    {
+        Settings settings = new();
+        settings.FileHistoryList.Add("ordinary.log");
+        Mock<IConfigManager> config = CreateConfig(settings);
+        FakeRuntime runtime = new("history", _ => Snapshot("history"));
+        FakeRuntimeFactory runtimeFactory = new() { CreateRuntime = _ => runtime };
+        _host = CreateHost(runtimeFactory, new FakePicker(null), configManager: config.Object);
+
+        OpenAndDrainInitialRefresh(_host, _testDirectory);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(settings.RecentMinecraftWorkspaceRoots, Is.EqualTo(new[] { MinecraftWorkspaceSettingsStore.NormalizeRoot(_testDirectory) }));
+            Assert.That(settings.FileHistoryList, Is.EqualTo(new[] { "ordinary.log" }));
+            Assert.That(runtimeFactory.CreatedPaths, Is.EqualTo(new[] { _testDirectory }));
+        });
+        config.Verify(manager => manager.Save(SettingsFlags.Settings), Times.Once);
+    }
+
+    [Test]
+    public void Persisted_disabled_source_policy_is_loaded_again_after_settings_reload ()
+    {
+        _ = CreateFile("logs/yeezus.log", "2026-09-28T10:00:00Z [INFO] [yeezus-core] [Client thread] disabled after restart\n");
+        string sourceId = new MinecraftSourceDiscovery(new MinecraftWorkspace(_testDirectory))
+            .Rescan().Files.Single().SourceId;
+        Settings settings = new();
+        MinecraftWorkspaceSettingsStore initialStore = new(CreateConfig(settings).Object);
+        initialStore.SetSourceEnabled(_testDirectory, sourceId, enabled: false);
+
+        TrackingWorkspaceRuntimeFactory firstFactory = new(new MinecraftWorkspaceHostRuntimeFactory(PluginRegistry.PluginRegistry.Instance, 2048));
+        _host = CreateHost(firstFactory, new FakePicker(null), configManager: CreateConfig(settings).Object);
+        OpenAndDrainInitialRefresh(_host, _testDirectory);
+        Assert.Multiple(() =>
+        {
+            Assert.That(firstFactory.InitialDisabledSourceIds.Single(), Is.EqualTo(new[] { sourceId }));
+            Assert.That(firstFactory.LastRuntime!.Coordinator.IsSourceEnabled(sourceId), Is.False);
+            Assert.That(_host.Controller.ActiveDocument!.WorkspaceControl.LogicalSources.Single().Status, Is.EqualTo(MinecraftWorkspaceSourceStatus.Disabled));
+            Assert.That(_host.Controller.ActiveDocument.WorkspaceControl.LogicalSources.Single().HasResumeCheckpoint, Is.False);
+        });
+
+        Settings reloadedSettings = Newtonsoft.Json.JsonConvert.DeserializeObject<Settings>(Newtonsoft.Json.JsonConvert.SerializeObject(settings))!;
+        _host.Dispose();
+        _host = null;
+
+        TrackingWorkspaceRuntimeFactory reopenedFactory = new(new MinecraftWorkspaceHostRuntimeFactory(PluginRegistry.PluginRegistry.Instance, 2048));
+        _host = CreateHost(reopenedFactory, new FakePicker(null), configManager: CreateConfig(reloadedSettings).Object);
+        OpenAndDrainInitialRefresh(_host, _testDirectory);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(reopenedFactory.InitialDisabledSourceIds.Single(), Is.EqualTo(new[] { sourceId }));
+            Assert.That(reopenedFactory.LastRuntime!.Coordinator.IsSourceEnabled(sourceId), Is.False);
+            Assert.That(_host.Controller.ActiveDocument!.WorkspaceControl.LogicalSources.Single().HasResumeCheckpoint, Is.False,
+                "Runtime byte checkpoints are intentionally not persisted across restart.");
+            Assert.That(reloadedSettings.RecentMinecraftWorkspaceRoots, Is.EqualTo(new[] { MinecraftWorkspaceSettingsStore.NormalizeRoot(_testDirectory) }));
         });
     }
 
@@ -708,6 +781,10 @@ public sealed class MinecraftWorkspaceHostControllerTests
     [Test]
     public void File_menu_command_uses_picker_host_path_without_changing_normal_log_tabs ()
     {
+        string badRoot = Path.Combine(_testDirectory, "bad");
+        string goodRoot = Path.Combine(_testDirectory, "good");
+        _ = Directory.CreateDirectory(badRoot);
+        _ = Directory.CreateDirectory(goodRoot);
         Settings settings = new();
         var fontConverter = TypeDescriptor.GetConverter(typeof(Font));
         settings.Preferences.Font = (Font)fontConverter.ConvertFromInvariantString(settings.Preferences.FontString)!;
@@ -716,7 +793,7 @@ public sealed class MinecraftWorkspaceHostControllerTests
         FakePicker picker = new(null);
         FakeRuntimeFactory runtimeFactory = new();
         FakeRuntime fakeRuntime = new("menu", _ => Snapshot("workspace"));
-        runtimeFactory.CreateRuntime = path => path == "bad" ? throw new IOException("synthetic open failure") : fakeRuntime;
+        runtimeFactory.CreateRuntime = path => path == badRoot ? throw new IOException("synthetic open failure") : fakeRuntime;
         ManualRefreshTriggerFactory triggerFactory = new();
         QueuedHostDispatcher dispatcher = new();
         List<Exception> errors = [];
@@ -748,14 +825,14 @@ public sealed class MinecraftWorkspaceHostControllerTests
             command.PerformClick();
             Assert.That(tabController.GetAllWindows(), Is.EqualTo(originalTabs));
 
-            picker.Path = "bad";
+            picker.Path = badRoot;
             command.PerformClick();
             dispatcher.RunNextBackground();
             dispatcher.RunNextUi();
             Application.DoEvents();
             Assert.That(tabController.GetAllWindows(), Is.EqualTo(originalTabs));
 
-            picker.Path = "good";
+            picker.Path = goodRoot;
             command.PerformClick();
             dispatcher.RunNextBackground();
             dispatcher.RunNextUi();
@@ -766,7 +843,7 @@ public sealed class MinecraftWorkspaceHostControllerTests
                 Assert.That(command.Text, Is.EqualTo("Open Minecraft Workspace…"));
                 Assert.That(picker.CallCount, Is.EqualTo(3));
                 Assert.That(window.WorkspaceHostController.ActiveDocument, Is.Not.Null);
-                Assert.That(runtimeFactory.CreatedPaths, Is.EqualTo(new[] { "bad", "good" }));
+                Assert.That(runtimeFactory.CreatedPaths, Is.EqualTo(new[] { badRoot, goodRoot }));
                 Assert.That(tabController.GetAllWindows(), Is.EqualTo(originalTabs));
                 Assert.That(tabController.GetAllWindows(), Is.Empty);
                 Assert.That(errors, Has.Count.EqualTo(1));
@@ -791,6 +868,299 @@ public sealed class MinecraftWorkspaceHostControllerTests
 
             CultureInfo.CurrentUICulture = previousUiCulture;
         }
+    }
+
+    [Test]
+    public void Recent_workspace_menu_uses_host_open_path_and_remove_leaves_directory_intact ()
+    {
+        Settings settings = new();
+        settings.RecentMinecraftWorkspaceRoots.Add(_testDirectory);
+        string missingRoot = Path.Combine(_testDirectory, "missing-workspace");
+        settings.RecentMinecraftWorkspaceRoots.Add(missingRoot);
+        var fontConverter = TypeDescriptor.GetConverter(typeof(Font));
+        settings.Preferences.Font = (Font)fontConverter.ConvertFromInvariantString(settings.Preferences.FontString)!;
+        Mock<IConfigManager> config = CreateConfig(settings);
+        FakeRuntime runtime = new("recent", _ => Snapshot("recent"));
+        string normalizedMissingRoot = MinecraftWorkspaceSettingsStore.NormalizeRoot(missingRoot);
+        FakeRuntimeFactory runtimeFactory = new()
+        {
+            CreateRuntime = path => string.Equals(path, normalizedMissingRoot, StringComparison.OrdinalIgnoreCase)
+                ? throw new DirectoryNotFoundException("synthetic missing recent workspace")
+                : runtime
+        };
+        ManualRefreshTriggerFactory triggerFactory = new();
+        QueuedHostDispatcher dispatcher = new();
+        List<Exception> errors = [];
+        LogTabWindow window = new(
+            [],
+            1,
+            false,
+            config.Object,
+            null,
+            new FakePicker(null),
+            runtimeFactory,
+            triggerFactory.Create,
+            dispatcher,
+            errors.Add);
+        _ = _host = new TestHost(window, GetDockPanel(window), window.WorkspaceHostController, dispatcher, triggerFactory, errors);
+
+        try
+        {
+            window.Show();
+            Application.DoEvents();
+            ToolStripMenuItem recentMenu = GetRecentWorkspaceMenu(window);
+            ToolStripMenuItem recentItem = recentMenu.DropDownItems
+                .Cast<ToolStripMenuItem>()
+                .First(item => item.Name == "RecentMinecraftWorkspaceItem");
+
+            recentItem.PerformClick();
+            dispatcher.RunNextBackground();
+            dispatcher.RunNextUi();
+            Application.DoEvents();
+
+            Assert.That(window.WorkspaceHostController.ActiveDocument, Is.Not.Null);
+            Assert.That(runtimeFactory.CreatedPaths, Is.EqualTo(new[] { _testDirectory }));
+            Assert.That(settings.RecentMinecraftWorkspaceRoots, Is.EqualTo(new[]
+            {
+                MinecraftWorkspaceSettingsStore.NormalizeRoot(_testDirectory), normalizedMissingRoot
+            }));
+            Assert.That(errors, Is.Empty);
+
+            MinecraftWorkspaceReadOnlyDocument openedDocument = window.WorkspaceHostController.ActiveDocument!;
+            ToolStripMenuItem missingItem = GetRecentWorkspaceMenu(window).DropDownItems
+                .Cast<ToolStripMenuItem>()
+                .Single(item => item.Name == "RecentMinecraftWorkspaceItem" && item.Tag as string == normalizedMissingRoot);
+            missingItem.PerformClick();
+            dispatcher.DrainBackgroundAndUi();
+            Application.DoEvents();
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(window.WorkspaceHostController.ActiveDocument, Is.SameAs(openedDocument));
+                Assert.That(settings.RecentMinecraftWorkspaceRoots, Does.Contain(normalizedMissingRoot));
+                Assert.That(errors, Has.Count.EqualTo(1));
+            });
+
+            ToolStripMenuItem removeItem = missingItem.DropDownItems.Cast<ToolStripMenuItem>().Single();
+            removeItem.PerformClick();
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(settings.RecentMinecraftWorkspaceRoots, Is.EqualTo(new[] { MinecraftWorkspaceSettingsStore.NormalizeRoot(_testDirectory) }));
+                Assert.That(Directory.Exists(_testDirectory), Is.True);
+                Assert.That(Directory.Exists(missingRoot), Is.False);
+                Assert.That(settings.FileHistoryList, Is.Empty);
+            });
+        }
+        finally
+        {
+            if (!window.IsDisposed)
+            {
+                window.Close();
+                window.Dispose();
+            }
+        }
+    }
+
+    [Test]
+    public async Task Real_source_toggle_suspends_exactly_resumes_and_rescan_keeps_the_view_state ()
+    {
+        const string initial = "2026-09-28T10:00:00Z [INFO] [yeezus-core] [Client thread] Y80_MATCH initial";
+        const string pending = "2026-09-28T10:00:01Z [ERROR] [yeezus-core] [Client thread] Y80_MATCH pending at disable";
+        string yeezusPath = CreateFile("logs/yeezus.log", initial + "\n" + pending + "\n");
+        Settings settings = new();
+        Mock<IConfigManager> config = CreateConfig(settings);
+        TrackingWorkspaceRuntimeFactory runtimeFactory = new(new MinecraftWorkspaceHostRuntimeFactory(PluginRegistry.PluginRegistry.Instance, 2048));
+        _host = CreateHost(runtimeFactory, new FakePicker(_testDirectory), configManager: config.Object);
+
+        Assert.That(OpenSelectedAndDrain(_host), Is.True);
+        _host.Dispatcher.DrainBackgroundAndUi();
+        MinecraftWorkspaceReadOnlyControl control = _host.Controller.ActiveDocument!.WorkspaceControl;
+        PumpUntil(_host, () => control.Snapshot.Rows.Any(row => row.Message.Contains("Y80_MATCH initial", StringComparison.Ordinal)));
+        control.SearchTextBox.Text = "Y80_MATCH";
+        _host.Dispatcher.DrainBackgroundAndUi();
+        PumpUntil(_host, () => control.Snapshot.QuerySnapshot.SearchText == "Y80_MATCH");
+        MinecraftWorkspaceTimelineFilterQuery activeQuery = control.Snapshot.QuerySnapshot;
+        int queryChanges = 0;
+        control.FilterQueryChanged += (_, _) => queryChanges++;
+
+        MinecraftWorkspaceReadOnlyRow initialRow = control.Snapshot.Rows.Single(row => row.Message.Contains("Y80_MATCH initial", StringComparison.Ordinal));
+        long selectedIdentity = initialRow.Identity;
+        EventRef selectedEventRef = initialRow.Details.EventRef;
+        FileRef selectedFileRef = initialRow.Details.FileRef;
+        int selectedRow = control.Snapshot.Rows.ToList().FindIndex(row => row.Identity == selectedIdentity);
+        control.EventGrid.CurrentCell = control.EventGrid.Rows[selectedRow].Cells[0];
+        control.EventGrid.Rows[selectedRow].Selected = true;
+        Application.DoEvents();
+        control.FollowCheckBox.Checked = false;
+        control.PauseButton.PerformClick();
+        Application.DoEvents();
+
+        MinecraftWorkspaceLogicalSourceSnapshot yeezusSource = control.LogicalSources.Single(source => source.Family == MinecraftSourceFamily.Yeezus);
+        int sourceIndex = control.LiveSourceList.Items
+            .Cast<MinecraftWorkspaceLogicalSourceEditorItem>()
+            .ToList()
+            .FindIndex(item => item.Source.SourceId == yeezusSource.SourceId);
+        Assert.That(sourceIndex, Is.GreaterThanOrEqualTo(0));
+        control.FacetTabs.SelectedTab = control.FacetTabs.TabPages.Cast<TabPage>().Single(page => page.Name == "WorkspaceLiveSourcesTab");
+        long sourceGenerationBeforeRapidToggle = runtimeFactory.LastRuntime!.Coordinator.GetRuntimeSources()
+            .Single(state => state.Source.SourceId == yeezusSource.SourceId).Generation;
+        control.LiveSourceList.SetItemChecked(sourceIndex, false);
+        control.LiveSourceList.SetItemChecked(sourceIndex, true);
+        _host.Dispatcher.DrainBackgroundAndUi();
+        Assert.Multiple(() =>
+        {
+            Assert.That(runtimeFactory.LastRuntime.Coordinator.IsSourceEnabled(yeezusSource.SourceId), Is.True);
+            Assert.That(settings.MinecraftWorkspaceSourcePolicies, Is.Empty);
+            Assert.That(runtimeFactory.LastRuntime.Coordinator.GetRuntimeSources()
+                .Single(state => state.Source.SourceId == yeezusSource.SourceId).Generation, Is.EqualTo(sourceGenerationBeforeRapidToggle));
+            Assert.That(control.Snapshot.QuerySnapshot, Is.SameAs(activeQuery));
+            Assert.That(control.SelectedIdentity, Is.EqualTo(selectedIdentity));
+            Assert.That(control.IsPaused, Is.True);
+        });
+        sourceIndex = control.LiveSourceList.Items
+            .Cast<MinecraftWorkspaceLogicalSourceEditorItem>()
+            .ToList()
+            .FindIndex(item => item.Source.SourceId == yeezusSource.SourceId);
+        control.LiveSourceList.SetItemChecked(sourceIndex, false);
+        _host.Dispatcher.DrainBackgroundAndUi();
+        int sourceFacetCount = control.SourceFacetList.Items.Count;
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(control.LogicalSources.Single(source => source.SourceId == yeezusSource.SourceId).Status, Is.EqualTo(MinecraftWorkspaceSourceStatus.Disabled));
+            Assert.That(control.IsPaused, Is.True);
+            Assert.That(control.BacklogCount, Is.Zero);
+            Assert.That(control.IsFollowEnabled, Is.False);
+            Assert.That(control.Snapshot.Rows, Has.Count.EqualTo(1));
+            Assert.That(control.Snapshot.QuerySnapshot, Is.SameAs(activeQuery));
+            Assert.That(control.SelectedIdentity, Is.EqualTo(selectedIdentity));
+            Assert.That(control.SourceFacetList.Items, Has.Count.EqualTo(sourceFacetCount));
+            Assert.That(settings.MinecraftWorkspaceSourcePolicies.Single().DisabledSourceIds, Does.Contain(yeezusSource.SourceId));
+            Assert.That(runtimeFactory.LastRuntime!.Coordinator.IsSourceEnabled(yeezusSource.SourceId), Is.False);
+            Assert.That(queryChanges, Is.Zero);
+        });
+
+        await File.AppendAllTextAsync(yeezusPath,
+            "2026-09-28T10:00:02Z [INFO] [yeezus-core] [Client thread] Y80_MATCH append-one\n" +
+            "2026-09-28T10:00:03Z [INFO] [yeezus-core] [Client thread] Y80_MATCH append-two\n" +
+            "2026-09-28T10:00:04Z [INFO] [yeezus-core] [Client thread] Y80_MATCH append-boundary\n",
+            new UTF8Encoding(false)).ConfigureAwait(true);
+        control.RescanSourcesButton.PerformClick();
+        _host.Dispatcher.DrainBackgroundAndUi();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(control.Snapshot.Rows, Has.Count.EqualTo(1), "Disabled source append must not enter the timeline before resume.");
+            Assert.That(control.BacklogCount, Is.Zero);
+            Assert.That(control.Snapshot.QuerySnapshot, Is.SameAs(activeQuery));
+            Assert.That(control.LogicalSources.Single(source => source.SourceId == yeezusSource.SourceId).Status, Is.EqualTo(MinecraftWorkspaceSourceStatus.Disabled));
+            Assert.That(queryChanges, Is.Zero);
+        });
+
+        sourceIndex = control.LiveSourceList.Items
+            .Cast<MinecraftWorkspaceLogicalSourceEditorItem>()
+            .ToList()
+            .FindIndex(item => item.Source.SourceId == yeezusSource.SourceId);
+        control.LiveSourceList.SetItemChecked(sourceIndex, true);
+        _host.Dispatcher.DrainBackgroundAndUi();
+        PumpUntil(_host, () => control.IsPaused && control.BacklogCount == 3);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(control.Snapshot.Rows, Has.Count.EqualTo(1), "Pause keeps the presented rows frozen while the source catches up.");
+            Assert.That(control.Snapshot.QuerySnapshot.SearchText, Is.EqualTo("Y80_MATCH"));
+            Assert.That(control.SelectedIdentity, Is.EqualTo(selectedIdentity));
+            Assert.That(control.IsFollowEnabled, Is.False);
+            Assert.That(control.IsPaused, Is.True);
+            Assert.That(control.BacklogCount, Is.EqualTo(3));
+            Assert.That(settings.MinecraftWorkspaceSourcePolicies, Is.Empty);
+        });
+
+        control.PauseButton.PerformClick();
+        PumpUntil(_host, () => control.Snapshot.Rows.Count == 4);
+        control.FacetTabs.SelectedTab = control.FacetTabs.TabPages.Cast<TabPage>().Single(page => page.Name == "WorkspaceLiveSourcesTab");
+        long yeezusCreatedGeneration = runtimeFactory.LastRuntime!.Coordinator.GetRuntimeSources()
+            .Single(state => state.Source.SourceId == yeezusSource.SourceId).Generation;
+        string newCfmPath = CreateFile(
+            "cactusmonitor/sessions/cfm-y80-rescan.jsonl",
+            $"{{\"type\":\"CYCLE\",\"sessionId\":\"Y80-RESCAN\",\"sequence\":1,\"timestampEpochMillis\":{Utc("2099-01-01T10:05:00Z").ToUnixTimeMilliseconds()}}}\n");
+        control.RescanSourcesButton.PerformClick();
+        PumpUntil(_host, () => control.LogicalSources.Any(source => source.Family == MinecraftSourceFamily.CactusMonitor) &&
+            control.Snapshot.TotalLoadedCount == 5);
+        _host.Dispatcher.DrainBackgroundAndUi();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(File.Exists(newCfmPath), Is.True);
+            Assert.That(control.LogicalSources, Has.Count.EqualTo(2));
+            Assert.That(control.Snapshot.QuerySnapshot, Is.SameAs(activeQuery));
+            Assert.That(control.Snapshot.TotalLoadedCount, Is.EqualTo(5));
+            Assert.That(control.Snapshot.Rows.Count(row => row.Message.Contains("Y80_MATCH", StringComparison.Ordinal)), Is.EqualTo(4));
+            Assert.That(control.Snapshot.Rows.Count(row => row.Message.Contains("append-one", StringComparison.Ordinal)), Is.EqualTo(1));
+            Assert.That(control.Snapshot.Rows.Count(row => row.Message.Contains("append-two", StringComparison.Ordinal)), Is.EqualTo(1));
+            Assert.That(control.Snapshot.Rows.Count(row => row.Message.Contains("pending at disable", StringComparison.Ordinal)), Is.EqualTo(1));
+            Assert.That(control.SelectedIdentity, Is.EqualTo(selectedIdentity));
+            Assert.That(control.SelectedDetails!.EventRef, Is.SameAs(selectedEventRef));
+            Assert.That(control.SelectedDetails.FileRef, Is.SameAs(selectedFileRef));
+            Assert.That(control.IsFollowEnabled, Is.False);
+            Assert.That(control.IsPaused, Is.False);
+            Assert.That(runtimeFactory.LastRuntime.Coordinator.GetRuntimeSources()
+                .Single(state => state.Source.SourceId == yeezusSource.SourceId).Generation, Is.EqualTo(yeezusCreatedGeneration));
+            Assert.That(queryChanges, Is.Zero);
+            Assert.That(_host.Errors, Is.Empty);
+        });
+    }
+
+    [Test]
+    public void Rapid_toggles_for_distinct_logical_sources_are_applied_independently ()
+    {
+        _ = CreateFile("logs/latest.log", "[18:41:03] [Render thread/ERROR] latest source\n");
+        _ = CreateFile(
+            "cactusmonitor/sessions/cfm-y80-independent-toggles.jsonl",
+            $"{{\"type\":\"CYCLE\",\"sessionId\":\"Y80-TOGGLE\",\"sequence\":1,\"timestampEpochMillis\":{Utc("2099-01-01T10:05:00Z").ToUnixTimeMilliseconds()}}}\n");
+        Settings settings = new();
+        Mock<IConfigManager> config = CreateConfig(settings);
+        TrackingWorkspaceRuntimeFactory runtimeFactory = new(new MinecraftWorkspaceHostRuntimeFactory(PluginRegistry.PluginRegistry.Instance, 2048));
+        _host = CreateHost(runtimeFactory, new FakePicker(_testDirectory), configManager: config.Object);
+
+        Assert.That(OpenSelectedAndDrain(_host), Is.True);
+        _host.Dispatcher.DrainBackgroundAndUi();
+        MinecraftWorkspaceReadOnlyControl control = _host.Controller.ActiveDocument!.WorkspaceControl;
+        PumpUntil(_host, () => control.Snapshot.TotalLoadedCount == 2);
+        IReadOnlyList<MinecraftWorkspaceLogicalSourceSnapshot> sources = control.LogicalSources;
+        string[] sourceIds = sources.Select(source => source.SourceId).ToArray();
+        Assert.That(sourceIds, Has.Length.EqualTo(2));
+        MinecraftWorkspaceReadOnlyViewSnapshot initialSnapshot = control.Snapshot;
+        int sourceFacetCount = control.SourceFacetList.Items.Count;
+
+        control.FacetTabs.SelectedTab = control.FacetTabs.TabPages.Cast<TabPage>()
+            .Single(page => page.Name == "WorkspaceLiveSourcesTab");
+        int[] sourceIndexes = control.LiveSourceList.Items
+            .Cast<MinecraftWorkspaceLogicalSourceEditorItem>()
+            .Select((item, index) => (item, index))
+            .Where(pair => sourceIds.Contains(pair.item.Source.SourceId, StringComparer.Ordinal))
+            .Select(pair => pair.index)
+            .ToArray();
+        Assert.That(sourceIndexes, Has.Length.EqualTo(2));
+
+        control.LiveSourceList.SetItemChecked(sourceIndexes[0], false);
+        control.LiveSourceList.SetItemChecked(sourceIndexes[1], false);
+        _host.Dispatcher.DrainBackgroundAndUi();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(sourceIds.All(sourceId => !runtimeFactory.LastRuntime!.Coordinator.IsSourceEnabled(sourceId)), Is.True);
+            Assert.That(settings.MinecraftWorkspaceSourcePolicies.Single().DisabledSourceIds, Is.EquivalentTo(sourceIds));
+            Assert.That(control.LogicalSources.Where(source => sourceIds.Contains(source.SourceId, StringComparer.Ordinal))
+                .Select(source => source.Status), Is.All.EqualTo(MinecraftWorkspaceSourceStatus.Disabled));
+            Assert.That(control.Snapshot.QuerySnapshot, Is.SameAs(initialSnapshot.QuerySnapshot));
+            Assert.That(control.Snapshot.Rows.Select(row => row.Identity), Is.EqualTo(initialSnapshot.Rows.Select(row => row.Identity)));
+            Assert.That(control.SourceFacetList.Items, Has.Count.EqualTo(sourceFacetCount));
+            Assert.That(control.IsFollowEnabled, Is.True);
+            Assert.That(control.IsPaused, Is.False);
+            Assert.That(control.BacklogCount, Is.Zero);
+        });
     }
 
     [Test]
@@ -1258,7 +1628,8 @@ public sealed class MinecraftWorkspaceHostControllerTests
         IMinecraftWorkspaceHostRuntimeFactory runtimeFactory,
         FakePicker picker,
         Func<IMinecraftWorkspaceRefreshTrigger>? refreshTriggerFactory = null,
-        IMinecraftWorkspaceSourceNavigator? sourceNavigator = null)
+        IMinecraftWorkspaceSourceNavigator? sourceNavigator = null,
+        IConfigManager? configManager = null)
     {
         Form form = new()
         {
@@ -1287,8 +1658,17 @@ public sealed class MinecraftWorkspaceHostControllerTests
             refreshTriggerFactory,
             dispatcher,
             errors.Add,
-            sourceNavigator);
+            sourceNavigator,
+            configManager);
         return _host = new TestHost(form, dockPanel, controller, dispatcher, triggerFactory, errors);
+    }
+
+    private static Mock<IConfigManager> CreateConfig (Settings settings)
+    {
+        Mock<IConfigManager> config = new();
+        _ = config.Setup(manager => manager.Settings).Returns(settings);
+        _ = config.Setup(manager => manager.Save(It.IsAny<SettingsFlags>()));
+        return config;
     }
 
     private static void OpenWorkspace (TestHost host, string path)
@@ -1498,15 +1878,23 @@ public sealed class MinecraftWorkspaceHostControllerTests
         }
     }
 
-    private sealed class TrackingWorkspaceRuntimeFactory (MinecraftWorkspaceHostRuntimeFactory inner) : IMinecraftWorkspaceHostRuntimeFactory
+    private sealed class TrackingWorkspaceRuntimeFactory (MinecraftWorkspaceHostRuntimeFactory inner) :
+        IMinecraftWorkspaceHostRuntimeFactory,
+        IMinecraftWorkspaceHostRuntimeFactoryWithSourcePolicy
     {
         public List<MinecraftWorkspaceHostRuntime> CreatedRuntimes { get; } = [];
+
+        public List<IReadOnlyList<string>> InitialDisabledSourceIds { get; } = [];
 
         public MinecraftWorkspaceHostRuntime? LastRuntime { get; private set; }
 
         public IMinecraftWorkspaceHostRuntime Create (string rootPath)
+            => Create(rootPath, []);
+
+        public IMinecraftWorkspaceHostRuntime Create (string rootPath, IReadOnlyList<string> initiallyDisabledSourceIds)
         {
-            LastRuntime = (MinecraftWorkspaceHostRuntime)inner.Create(rootPath);
+            InitialDisabledSourceIds.Add(Array.AsReadOnly(initiallyDisabledSourceIds.ToArray()));
+            LastRuntime = (MinecraftWorkspaceHostRuntime)inner.Create(rootPath, initiallyDisabledSourceIds);
             CreatedRuntimes.Add(LastRuntime);
             return LastRuntime;
         }
@@ -1753,6 +2141,12 @@ public sealed class MinecraftWorkspaceHostControllerTests
     private static ToolStripMenuItem GetWorkspaceMenuCommand (LogTabWindow window)
     {
         FieldInfo field = typeof(LogTabWindow).GetField("openMinecraftWorkspaceToolStripMenuItem", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        return (ToolStripMenuItem)field.GetValue(window)!;
+    }
+
+    private static ToolStripMenuItem GetRecentWorkspaceMenu (LogTabWindow window)
+    {
+        FieldInfo field = typeof(LogTabWindow).GetField("recentMinecraftWorkspacesToolStripMenuItem", BindingFlags.Instance | BindingFlags.NonPublic)!;
         return (ToolStripMenuItem)field.GetValue(window)!;
     }
 

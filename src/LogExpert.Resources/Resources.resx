@@ -2380,4 +2380,13 @@ Restart LogExpert to apply changes?</value>
   <data name="MinecraftWorkspace_Live_Following" xml:space="preserve"><value>Live · Following</value></data>
   <data name="MinecraftWorkspace_Live_Anchored" xml:space="preserve"><value>Live · Follow off</value></data>
   <data name="MinecraftWorkspace_Live_Paused" xml:space="preserve"><value>Paused · Backlog: {0}</value></data>
+  <data name="MinecraftWorkspace_Sources_Tab" xml:space="preserve"><value>Live sources</value></data>
+  <data name="MinecraftWorkspace_Sources_Explanation" xml:space="preserve"><value>Controls live ingestion. The Source facet only filters events already in the timeline.</value></data>
+  <data name="MinecraftWorkspace_Sources_Rescan" xml:space="preserve"><value>Rescan</value></data>
+  <data name="MinecraftWorkspace_Sources_Tooltip" xml:space="preserve"><value>Enable or disable live ingestion for each logical source.</value></data>
+  <data name="MinecraftWorkspace_Sources_Enabled" xml:space="preserve"><value>Enabled</value></data>
+  <data name="MinecraftWorkspace_Sources_Disabled" xml:space="preserve"><value>Disabled</value></data>
+  <data name="LogTabWindow_RecentMinecraftWorkspaces" xml:space="preserve"><value>Recent Minecraft Workspaces</value></data>
+  <data name="LogTabWindow_RemoveRecentMinecraftWorkspace" xml:space="preserve"><value>Remove from recent workspaces</value></data>
+  <data name="LogTabWindow_NoRecentMinecraftWorkspaces" xml:space="preserve"><value>No recent Minecraft workspaces</value></data>
 </root>
