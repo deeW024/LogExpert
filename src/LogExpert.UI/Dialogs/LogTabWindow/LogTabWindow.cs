@@ -149,8 +149,11 @@ internal partial class LogTabWindow : Form, ILogTabWindow
                 Resources.LogExpert_Common_UI_Title_Error,
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Error)),
-            new MinecraftWorkspaceSourceNavigator(_fileOperationService.AddFileTab));
+            new MinecraftWorkspaceSourceNavigator(_fileOperationService.AddFileTab),
+            ConfigManager);
 
+        _minecraftWorkspaceHostController.RecentWorkspacesChanged += (_, _) => FillRecentMinecraftWorkspaceMenu();
+        FillRecentMinecraftWorkspaceMenu();
         _fileOperationService.FileHistoryChanged += (_, _) => FillHistoryMenu();
         _fileOperationService.FileOpened += OnFileOperationServiceFileOpened;
 
@@ -1851,6 +1854,59 @@ internal partial class LogTabWindow : Form, ILogTabWindow
     private async void OnOpenMinecraftWorkspaceToolStripMenuItemClick (object? sender, EventArgs e)
     {
         _ = await _minecraftWorkspaceHostController.OpenSelectedWorkspaceAsync().ConfigureAwait(true);
+    }
+
+    private void OnRecentMinecraftWorkspacesDropDownOpening (object? sender, EventArgs e) => FillRecentMinecraftWorkspaceMenu();
+
+    private async void OnRecentMinecraftWorkspaceClick (object? sender, EventArgs e)
+    {
+        if (sender is ToolStripMenuItem { Tag: string rootPath })
+        {
+            _ = await _minecraftWorkspaceHostController.OpenWorkspaceAsync(rootPath).ConfigureAwait(true);
+        }
+    }
+
+    private void OnRemoveRecentMinecraftWorkspaceClick (object? sender, EventArgs e)
+    {
+        if (sender is ToolStripMenuItem { Tag: string rootPath })
+        {
+            _minecraftWorkspaceHostController.RemoveRecentWorkspace(rootPath);
+        }
+    }
+
+    private void FillRecentMinecraftWorkspaceMenu ()
+    {
+        recentMinecraftWorkspacesToolStripMenuItem.DropDownItems.Clear();
+        IReadOnlyList<string> roots = _minecraftWorkspaceHostController.GetRecentWorkspaceRoots();
+        if (roots.Count == 0)
+        {
+            recentMinecraftWorkspacesToolStripMenuItem.DropDownItems.Add(new ToolStripMenuItem(
+                Resources.ResourceManager.GetString("LogTabWindow_NoRecentMinecraftWorkspaces", CultureInfo.CurrentUICulture))
+            {
+                Enabled = false
+            });
+            return;
+        }
+
+        foreach (string rootPath in roots)
+        {
+            ToolStripMenuItem recentItem = new(rootPath)
+            {
+                Name = "RecentMinecraftWorkspaceItem",
+                Tag = rootPath,
+                ToolTipText = rootPath,
+                AutoToolTip = true
+            };
+            recentItem.Click += OnRecentMinecraftWorkspaceClick;
+            ToolStripMenuItem removeItem = new(
+                Resources.ResourceManager.GetString("LogTabWindow_RemoveRecentMinecraftWorkspace", CultureInfo.CurrentUICulture))
+            {
+                Tag = rootPath
+            };
+            removeItem.Click += OnRemoveRecentMinecraftWorkspaceClick;
+            recentItem.DropDownItems.Add(removeItem);
+            recentMinecraftWorkspacesToolStripMenuItem.DropDownItems.Add(recentItem);
+        }
     }
 
     private void OnSelectFilterToolStripMenuItemClick (object sender, EventArgs e)

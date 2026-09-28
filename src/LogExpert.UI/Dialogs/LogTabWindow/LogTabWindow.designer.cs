@@ -32,6 +32,7 @@ namespace LogExpert.UI.Controls.LogTabWindow
             fileToolStripMenuItem = new ToolStripMenuItem();
             openToolStripMenuItem = new ToolStripMenuItem();
             openMinecraftWorkspaceToolStripMenuItem = new ToolStripMenuItem();
+            recentMinecraftWorkspacesToolStripMenuItem = new ToolStripMenuItem();
             openURIToolStripMenuItem = new ToolStripMenuItem();
             closeFileToolStripMenuItem = new ToolStripMenuItem();
             reloadToolStripMenuItem = new ToolStripMenuItem();
@@ -201,7 +202,7 @@ namespace LogExpert.UI.Controls.LogTabWindow
             // 
             // fileToolStripMenuItem
             // 
-            fileToolStripMenuItem.DropDownItems.AddRange(new ToolStripItem[] { openToolStripMenuItem, openMinecraftWorkspaceToolStripMenuItem, openURIToolStripMenuItem, closeFileToolStripMenuItem, reloadToolStripMenuItem, newFromClipboardToolStripMenuItem, ToolStripSeparator1, multiFileToolStripMenuItem, ToolStripSeparator2, loadSessionToolStripMenuItem, saveSessionToolStripMenuItem, exportBookmarksToolStripMenuItem, ToolStripSeparator3, lastUsedToolStripMenuItem, exitToolStripMenuItem });
+            fileToolStripMenuItem.DropDownItems.AddRange(new ToolStripItem[] { openToolStripMenuItem, openMinecraftWorkspaceToolStripMenuItem, recentMinecraftWorkspacesToolStripMenuItem, openURIToolStripMenuItem, closeFileToolStripMenuItem, reloadToolStripMenuItem, newFromClipboardToolStripMenuItem, ToolStripSeparator1, multiFileToolStripMenuItem, ToolStripSeparator2, loadSessionToolStripMenuItem, saveSessionToolStripMenuItem, exportBookmarksToolStripMenuItem, ToolStripSeparator3, lastUsedToolStripMenuItem, exitToolStripMenuItem });
             fileToolStripMenuItem.Name = "fileToolStripMenuItem";
             fileToolStripMenuItem.Size = new Size(37, 19);
             fileToolStripMenuItem.Text = "File";
@@ -223,6 +224,13 @@ namespace LogExpert.UI.Controls.LogTabWindow
             openMinecraftWorkspaceToolStripMenuItem.Size = new Size(243, 22);
             openMinecraftWorkspaceToolStripMenuItem.Text = LogExpert.Resources.LogTabWindow_UI_ToolStripMenuItem_openMinecraftWorkspaceToolStripMenuItem;
             openMinecraftWorkspaceToolStripMenuItem.Click += OnOpenMinecraftWorkspaceToolStripMenuItemClick;
+            //
+            // recentMinecraftWorkspacesToolStripMenuItem
+            //
+            recentMinecraftWorkspacesToolStripMenuItem.Name = "recentMinecraftWorkspacesToolStripMenuItem";
+            recentMinecraftWorkspacesToolStripMenuItem.Size = new Size(243, 22);
+            recentMinecraftWorkspacesToolStripMenuItem.Text = LogExpert.Resources.ResourceManager.GetString("LogTabWindow_RecentMinecraftWorkspaces", System.Globalization.CultureInfo.CurrentUICulture);
+            recentMinecraftWorkspacesToolStripMenuItem.DropDownOpening += OnRecentMinecraftWorkspacesDropDownOpening;
             // 
             // openURIToolStripMenuItem
             // 
@@ -1076,6 +1084,8 @@ namespace LogExpert.UI.Controls.LogTabWindow
         private System.Windows.Forms.ToolStripStatusLabel labelStatus;
         private System.Windows.Forms.ToolStripMenuItem openToolStripMenuItem;
         private System.Windows.Forms.ToolStripMenuItem openMinecraftWorkspaceToolStripMenuItem;
+
+        private System.Windows.Forms.ToolStripMenuItem recentMinecraftWorkspacesToolStripMenuItem;
         private System.Windows.Forms.ToolStripMenuItem helpToolStripMenuItem;
         private System.Windows.Forms.ToolStripMenuItem aboutToolStripMenuItem;
         private System.Windows.Forms.ToolStripContainer toolStripContainer;

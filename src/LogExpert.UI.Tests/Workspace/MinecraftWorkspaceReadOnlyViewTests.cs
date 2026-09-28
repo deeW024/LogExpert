@@ -1114,6 +1114,74 @@ public sealed class MinecraftWorkspaceReadOnlyViewTests
     }
 
     [Test]
+    public void Live_source_controls_are_logical_ingestion_controls_and_leave_view_state_unchanged ()
+    {
+        MinecraftWorkspaceIngressEvent ingress = CreateIngress(
+            1,
+            "source-control-file",
+            1,
+            "source control event",
+            Utc("2030-01-01T10:00:00Z"),
+            sourceId: "logical-yeezus");
+        MinecraftWorkspaceReadOnlyViewSnapshot snapshot = ViewSnapshot(ingress);
+        MinecraftWorkspaceLogicalSourceSnapshot active = CreateLogicalSource("logical-yeezus", "yeezus.log", enabled: true, MinecraftWorkspaceSourceStatus.Active, eventCount: 1);
+        MinecraftWorkspaceLogicalSourceSnapshot disabled = active with
+        {
+            IsEnabled = false,
+            Status = MinecraftWorkspaceSourceStatus.Disabled,
+            Segments = Array.AsReadOnly(active.Segments.Select(segment => segment with { Status = MinecraftWorkspaceSourceStatus.Disabled }).ToArray())
+        };
+        MinecraftWorkspaceLogicalSourceSnapshot newSource = CreateLogicalSource("logical-cfm", "cfm-session.jsonl", enabled: true, MinecraftWorkspaceSourceStatus.Active, eventCount: 0);
+
+        using Form form = CreateForm();
+        using var control = new MinecraftWorkspaceReadOnlyControl(snapshot);
+        form.Controls.Add(control);
+        form.Show();
+        Application.DoEvents();
+        control.FacetTabs.SelectedTab = control.FacetTabs.TabPages.Cast<TabPage>().Single(page => page.Name == "WorkspaceLiveSourcesTab");
+        Application.DoEvents();
+        control.ApplyLogicalSourceSnapshot([active]);
+        control.FollowCheckBox.Checked = false;
+        control.SetPaused(isPaused: true, backlogCount: 2);
+        MinecraftWorkspaceTimelineFilterQuery originalQuery = control.Snapshot.QuerySnapshot;
+        int originalFacetCount = control.SourceFacetList.Items.Count;
+        int queryChanges = 0;
+        int rescans = 0;
+        MinecraftWorkspaceSourceEnabledChangedEventArgs? sourceChange = null;
+        control.FilterQueryChanged += (_, _) => queryChanges++;
+        control.RescanRequested += (_, _) => rescans++;
+        control.LiveSourceEnabledChanged += (_, args) => sourceChange = args;
+
+        control.LiveSourceList.SetItemChecked(0, false);
+        string disabledLabel = control.LiveSourceList.Items[0]!.ToString()!;
+        control.ApplyLogicalSourceSnapshot([disabled, newSource]);
+        control.RescanSourcesButton.PerformClick();
+        Application.DoEvents();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(control.LiveSourceList.Items.Count, Is.EqualTo(2));
+            Assert.That(control.LiveSourceList.GetItemChecked(0), Is.False);
+            Assert.That(control.LiveSourceList.GetItemChecked(1), Is.True, "A newly discovered logical source is enabled by default.");
+            Assert.That(disabledLabel, Does.Contain("Yeezus").And.Contain("Enabled").And.Contain("Active").And.Contain("1 events").And.Contain("yeezus.log"));
+            Assert.That(((MinecraftWorkspaceLogicalSourceEditorItem)control.LiveSourceList.Items[0]!).ToString(), Does.Contain("Disabled").And.Contain("yeezus.log"));
+            Assert.That(sourceChange!.SourceId, Is.EqualTo("logical-yeezus"));
+            Assert.That(sourceChange.IsEnabled, Is.False);
+            Assert.That(control.Snapshot.QuerySnapshot, Is.SameAs(originalQuery));
+            Assert.That(control.SourceFacetList.Items.Count, Is.EqualTo(originalFacetCount));
+            Assert.That(control.Snapshot.Rows, Has.Count.EqualTo(1), "Disabling ingestion does not remove events already in the view.");
+            Assert.That(control.IsFollowEnabled, Is.False);
+            Assert.That(control.IsPaused, Is.True);
+            Assert.That(control.BacklogCount, Is.EqualTo(2));
+            Assert.That(queryChanges, Is.Zero);
+            Assert.That(rescans, Is.EqualTo(1));
+            Assert.That(control.FacetTabs.TabPages.Cast<TabPage>().Single(page => page.Name == "WorkspaceLiveSourcesTab"), Is.Not.Null);
+        });
+
+        form.Close();
+    }
+
+    [Test]
     public void Document_is_document_style_and_disposal_does_not_mutate_core_result ()
     {
         MinecraftWorkspaceTimeline timeline = Timeline([CreateIngress(1, "document-file", 1, "document event", Utc("2030-01-01T10:00:00Z"))]);
@@ -1352,6 +1420,28 @@ public sealed class MinecraftWorkspaceReadOnlyViewTests
 
     private static DateTimeOffset Utc (string value) =>
         DateTimeOffset.Parse(value, System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.AssumeUniversal);
+
+    private MinecraftWorkspaceLogicalSourceSnapshot CreateLogicalSource (
+        string sourceId,
+        string relativePath,
+        bool enabled,
+        MinecraftWorkspaceSourceStatus status,
+        long eventCount)
+    {
+        DiscoveredSourceFile source = new(
+            WorkspaceId,
+            sourceId,
+            $"file:{relativePath}",
+            $"logs/{relativePath}",
+            Path.Combine(_testDirectory, "logs", relativePath),
+            relativePath.StartsWith("cfm-", StringComparison.Ordinal) ? MinecraftSourceFamily.CactusMonitor : MinecraftSourceFamily.Yeezus,
+            relativePath.StartsWith("cfm-", StringComparison.Ordinal) ? MinecraftSourceAdapterHint.CactusMonitorSessionJsonl : MinecraftSourceAdapterHint.YeezusTextLog,
+            relativePath.StartsWith("cfm-", StringComparison.Ordinal) ? MinecraftSourceSegmentRole.Final : MinecraftSourceSegmentRole.Primary,
+            MinecraftDiscoveryProvenance.KnownPathRule,
+            MinecraftDiscoveryStatus.Observed);
+        MinecraftWorkspaceLogicalSourceSegmentSnapshot segment = new(source, status, null, eventCount, false);
+        return new MinecraftWorkspaceLogicalSourceSnapshot(sourceId, source.Family, source.Family == MinecraftSourceFamily.Yeezus ? "Yeezus" : "Cactus Monitor · cfm", enabled, [segment], status, eventCount, false);
+    }
 
     private string CreateFile (string relativePath, string content)
     {

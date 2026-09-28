@@ -31,6 +31,10 @@ public class Settings
 
     public List<string> FileHistoryList { get; set; } = [];
 
+    public List<string> RecentMinecraftWorkspaceRoots { get; set; } = [];
+
+    public List<MinecraftWorkspaceSourcePolicySettings> MinecraftWorkspaceSourcePolicies { get; set; } = [];
+
     public List<string> FilterHistoryList { get; set; } = [];
 
     public List<FilterParams> FilterList { get; set; } = [];
@@ -93,4 +97,12 @@ public class Settings
     public IList<string> UriHistoryList { get; set; } = [];
 
     public int VersionBuild { get; set; }
+}
+
+[Serializable]
+public sealed class MinecraftWorkspaceSourcePolicySettings
+{
+    public string WorkspaceId { get; set; } = string.Empty;
+
+    public List<string> DisabledSourceIds { get; set; } = [];
 }

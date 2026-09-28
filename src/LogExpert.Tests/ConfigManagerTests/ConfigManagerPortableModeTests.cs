@@ -1,5 +1,7 @@
 using System.Reflection;
 
+using LogExpert.Core.Config;
+
 using NUnit.Framework;
 
 namespace LogExpert.Tests.ConfigManagerTests;
@@ -797,6 +799,33 @@ public class ConfigManagerPortableModeTests
     }
 
     #endregion
+
+    [Test]
+    [Category("PortableMode")]
+    [Description("Workspace history and source policy are saved through the active portable settings file")]
+    public void WorkspaceSettings_SaveAndReload_UsesPortableSettingsPath ()
+    {
+        Settings settings = _configManager.Settings;
+        settings.Preferences.PortableMode = true;
+        settings.RecentMinecraftWorkspaceRoots.Add(Path.Join(_testDir, "workspace"));
+        settings.MinecraftWorkspaceSourcePolicies.Add(new MinecraftWorkspaceSourcePolicySettings
+        {
+            WorkspaceId = "minecraft-workspace:PORTABLE",
+            DisabledSourceIds = ["minecraft-workspace:PORTABLE/source:yeezus:LOGS/YEEZUS.LOG"]
+        });
+
+        _configManager.Save(SettingsFlags.Settings);
+
+        string settingsPath = Path.Join(_configManager.PortableConfigDir, "settings.json");
+        Settings reloaded = Newtonsoft.Json.JsonConvert.DeserializeObject<Settings>(File.ReadAllText(settingsPath))!;
+        Assert.Multiple(() =>
+        {
+            Assert.That(File.Exists(settingsPath), Is.True);
+            Assert.That(reloaded.RecentMinecraftWorkspaceRoots, Is.EqualTo(settings.RecentMinecraftWorkspaceRoots));
+            Assert.That(reloaded.MinecraftWorkspaceSourcePolicies.Single().DisabledSourceIds,
+                Is.EqualTo(settings.MinecraftWorkspaceSourcePolicies.Single().DisabledSourceIds));
+        });
+    }
 
     #region End-to-End Portable Mode Toggle Tests
 

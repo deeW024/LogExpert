@@ -1,3 +1,5 @@
+using System.Security.Cryptography;
+
 namespace LogExpert.Core.Classes.MinecraftLogs;
 
 #pragma warning disable CA1031 // Per-source creation, start, handoff, and teardown failures stay isolated.
@@ -8,7 +10,8 @@ public enum MinecraftWorkspaceSourceStatus
     ImmutableComplete,
     DeferredHandoff,
     HandoffFaulted,
-    Faulted
+    Faulted,
+    Disabled
 }
 
 public enum MinecraftWorkspaceSourceReason
@@ -42,6 +45,25 @@ public sealed record MinecraftWorkspaceIngressEvent (
     NormalizedLogEvent Event,
     DateTimeOffset IngestedAtUtc);
 
+/// <summary>A discovered physical segment and its current state within one logical source.</summary>
+public sealed record MinecraftWorkspaceLogicalSourceSegmentSnapshot (
+    DiscoveredSourceFile Source,
+    MinecraftWorkspaceSourceStatus Status,
+    MinecraftWorkspaceSourceReason? Reason,
+    long EmittedEventCount,
+    bool HasResumeCheckpoint);
+
+/// <summary>UI-independent state for a logical source, keyed by stable SourceId.</summary>
+public sealed record MinecraftWorkspaceLogicalSourceSnapshot (
+    string SourceId,
+    MinecraftSourceFamily Family,
+    string DisplayLabel,
+    bool IsEnabled,
+    IReadOnlyList<MinecraftWorkspaceLogicalSourceSegmentSnapshot> Segments,
+    MinecraftWorkspaceSourceStatus Status,
+    long EmittedEventCount,
+    bool HasResumeCheckpoint);
+
 /// <summary>
 /// Reconciles YEE-39 physical discovery with YEE-42 single-file sessions. The ingress queue
 /// is intentionally unbounded and no-drop in this slice; a memory/backpressure budget is a
@@ -57,6 +79,11 @@ public sealed class MinecraftWorkspaceLiveCoordinator : IDisposable
     private readonly Dictionary<string, SourceHandle> _sessions = new(StringComparer.Ordinal);
     private readonly Dictionary<string, MinecraftWorkspaceSourceRuntimeState> _sources = new(StringComparer.Ordinal);
     private readonly Dictionary<string, SourceProgress> _fileProgress = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, long> _fileEventCounts = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, DiscoveredSourceFile> _discoveredSources = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, SuspendedSource> _suspendedSources = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _disabledSourceIds = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _blockedResumeFileIds = new(StringComparer.Ordinal);
     private readonly Dictionary<string, PendingHandoff> _pendingCfmHandoffs = new(StringComparer.Ordinal);
     private readonly Dictionary<string, PendingHandoff> _pendingYeezusHandoffs = new(StringComparer.Ordinal);
     private readonly HashSet<string> _observedActivePartSourceIds = new(StringComparer.Ordinal);
@@ -71,7 +98,8 @@ public sealed class MinecraftWorkspaceLiveCoordinator : IDisposable
     public MinecraftWorkspaceLiveCoordinator (
         MinecraftSourceDiscovery discovery,
         IMinecraftWorkspaceLiveSourceSessionFactory sessionFactory,
-        TimeProvider? timeProvider = null)
+        TimeProvider? timeProvider = null,
+        IEnumerable<string>? initiallyDisabledSourceIds = null)
     {
         ArgumentNullException.ThrowIfNull(discovery);
         ArgumentNullException.ThrowIfNull(sessionFactory);
@@ -79,6 +107,10 @@ public sealed class MinecraftWorkspaceLiveCoordinator : IDisposable
         _discovery = discovery;
         _sessionFactory = sessionFactory;
         _timeProvider = timeProvider ?? TimeProvider.System;
+        if (initiallyDisabledSourceIds is not null)
+        {
+            _disabledSourceIds.UnionWith(initiallyDisabledSourceIds.Where(id => !string.IsNullOrWhiteSpace(id)));
+        }
     }
 
     /// <summary>Number of queued, undrained workspace events.</summary>
@@ -113,6 +145,11 @@ public sealed class MinecraftWorkspaceLiveCoordinator : IDisposable
             lock (_gate)
             {
                 ObjectDisposedException.ThrowIf(_disposeStarted, this);
+                _discoveredSources.Clear();
+                foreach (DiscoveredSourceFile source in snapshot.Files)
+                {
+                    _discoveredSources[source.FileId] = source;
+                }
                 isInitialSnapshot = !_hasReconciled;
                 observedActiveParts = new HashSet<string>(_observedActivePartSourceIds, StringComparer.Ordinal);
                 activatedPrimaries = new HashSet<string>(_activatedPrimarySourceIds, StringComparer.Ordinal);
@@ -156,6 +193,8 @@ public sealed class MinecraftWorkspaceLiveCoordinator : IDisposable
                 RemoveMissingSuccessors(_pendingYeezusHandoffs, presentFileIds);
             }
 
+            ReconcileSuspendedSources(snapshot.Files);
+
             ProcessPendingYeezusHandoffs(snapshot.Files);
             ProcessPendingCfmHandoffs(snapshot.Files);
 
@@ -169,6 +208,34 @@ public sealed class MinecraftWorkspaceLiveCoordinator : IDisposable
                     {
                         continue;
                     }
+                }
+
+                if (!IsSourceEnabled(source.SourceId))
+                {
+                    SetRuntimeState(
+                        source,
+                        MinecraftWorkspaceSourceStatus.Disabled,
+                        reason: null,
+                        GetEventCount(source.FileId),
+                        GetSuspendedCheckpoint(source.SourceId));
+                    continue;
+                }
+
+                if (IsResumeBlocked(source.FileId))
+                {
+                    continue;
+                }
+
+                if (TryResumeSuspendedSource(source))
+                {
+                    continue;
+                }
+
+                if (HasSuspendedSource(source.SourceId))
+                {
+                    // A different physical path may only be opened after its deterministic
+                    // YEE-45 successor has passed the saved-prefix check.
+                    continue;
                 }
 
                 if (RequiresDeferredHandoff(source, isInitialSnapshot, observedActiveParts, activatedPrimaries))
@@ -212,6 +279,98 @@ public sealed class MinecraftWorkspaceLiveCoordinator : IDisposable
                 .ThenBy(state => state.Source.FileId, StringComparer.Ordinal)
                 .ToArray();
             return Array.AsReadOnly(snapshot);
+        }
+    }
+
+    public IReadOnlyList<MinecraftWorkspaceLogicalSourceSnapshot> GetLogicalSourceSnapshot ()
+    {
+        lock (_gate)
+        {
+            MinecraftWorkspaceLogicalSourceSnapshot[] snapshot = _discoveredSources.Values
+                .GroupBy(source => source.SourceId, StringComparer.Ordinal)
+                .Select(group => CreateLogicalSourceSnapshot(group.OrderBy(source => source.RelativePath, StringComparer.OrdinalIgnoreCase)
+                    .ThenBy(source => source.RelativePath, StringComparer.Ordinal).ToArray()))
+                .OrderBy(source => source.DisplayLabel, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(source => source.SourceId, StringComparer.Ordinal)
+                .ToArray();
+            return Array.AsReadOnly(snapshot);
+        }
+    }
+
+    public bool IsSourceEnabled (string sourceId)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(sourceId);
+        lock (_gate)
+        {
+            return !_disabledSourceIds.Contains(sourceId);
+        }
+    }
+
+    /// <summary>Changes reader ownership for a complete logical source without finalizing pending records.</summary>
+    public void SetSourceEnabled (string sourceId, bool enabled)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(sourceId);
+        lock (_reconcileGate)
+        {
+            SourceHandle[] toSuspend;
+            lock (_gate)
+            {
+                ObjectDisposedException.ThrowIf(_disposeStarted, this);
+                if (enabled)
+                {
+                    _disabledSourceIds.Remove(sourceId);
+                    foreach (string fileId in _sources
+                        .Where(pair => pair.Value.Source.SourceId == sourceId && pair.Value.Status == MinecraftWorkspaceSourceStatus.Disabled)
+                        .Select(pair => pair.Key)
+                        .ToArray())
+                    {
+                        _sources.Remove(fileId);
+                    }
+
+                    toSuspend = [];
+                }
+                else
+                {
+                    _disabledSourceIds.Add(sourceId);
+                    toSuspend = _sessions.Values
+                        .Where(handle => string.Equals(handle.Source.SourceId, sourceId, StringComparison.Ordinal))
+                        .OrderBy(handle => handle.Source.RelativePath, StringComparer.OrdinalIgnoreCase)
+                        .ThenBy(handle => handle.Source.RelativePath, StringComparer.Ordinal)
+                        .ToArray();
+                }
+            }
+
+            foreach (SourceHandle handle in toSuspend)
+            {
+                SuspendSource(handle);
+            }
+
+            if (enabled)
+            {
+                Reconcile();
+            }
+            else
+            {
+                lock (_gate)
+                {
+                    foreach (DiscoveredSourceFile source in _discoveredSources.Values.Where(source => source.SourceId == sourceId))
+                    {
+                        MinecraftSourceHandoffCheckpoint? checkpoint = GetSuspendedCheckpointUnsafe(sourceId);
+                        SourceProgress progress = _fileProgress.TryGetValue(source.FileId, out SourceProgress? saved)
+                            ? saved
+                            : new SourceProgress(1, 1);
+                        long count = _fileEventCounts.TryGetValue(source.FileId, out long savedCount) ? savedCount : 0;
+                        _sources[source.FileId] = new MinecraftWorkspaceSourceRuntimeState(
+                            source,
+                            MinecraftWorkspaceSourceStatus.Disabled,
+                            Reason: null,
+                            count,
+                            progress.Generation,
+                            progress.NextSourceLocalSequence,
+                            checkpoint);
+                    }
+                }
+            }
         }
     }
 
@@ -266,6 +425,348 @@ public sealed class MinecraftWorkspaceLiveCoordinator : IDisposable
             }
         }
     }
+
+    private void SuspendSource (SourceHandle handle)
+    {
+        MinecraftSourceHandoffCheckpoint? checkpoint = null;
+        if (handle.Session is IMinecraftWorkspaceSourceHandoffSession handoffSession)
+        {
+            try
+            {
+                checkpoint = handoffSession.CaptureAndCloseForHandoff();
+            }
+            catch (Exception)
+            {
+                // A source that cannot provide a replay point is kept blocked on resume.
+            }
+        }
+
+        long observedLength = TryGetLength(handle.Source.FullPath) ?? checkpoint?.ConsumedByteFrontier ?? 0;
+        byte[]? prefixHash = TryGetPrefixHash(handle.Source.FullPath, observedLength);
+        lock (_gate)
+        {
+            _suspendedSources[handle.Source.FileId] = new SuspendedSource(
+                handle.Source,
+                checkpoint,
+                observedLength,
+                prefixHash);
+        }
+
+        DisposeHandle(handle, removeRuntimeState: false);
+    }
+
+    private void ReconcileSuspendedSources (IReadOnlyList<DiscoveredSourceFile> discoveredFiles)
+    {
+        SuspendedSource[] suspended;
+        lock (_gate)
+        {
+            suspended = _suspendedSources.Values.ToArray();
+        }
+
+        var filesById = discoveredFiles.ToDictionary(source => source.FileId, StringComparer.Ordinal);
+        foreach (SuspendedSource state in suspended)
+        {
+            if (state.Checkpoint is null)
+            {
+                lock (_gate)
+                {
+                    _blockedResumeFileIds.Add(state.Source.FileId);
+                }
+
+                continue;
+            }
+
+            bool originalStillPresent = filesById.TryGetValue(state.Source.FileId, out DiscoveredSourceFile? original);
+            if (originalStillPresent && HasMatchingSuspendedPrefix(state, original!.FullPath))
+            {
+                lock (_gate)
+                {
+                    _blockedResumeFileIds.Remove(state.Source.FileId);
+                }
+
+                continue;
+            }
+
+            if (originalStillPresent)
+            {
+                lock (_gate)
+                {
+                    _blockedResumeFileIds.Add(state.Source.FileId);
+                }
+            }
+
+            DiscoveredSourceFile? successor = FindDeterministicSuccessor(state.Source, discoveredFiles);
+            if (successor is null)
+            {
+                if (originalStillPresent && IsSourceEnabled(state.Source.SourceId))
+                {
+                    SetHandoffFaulted(
+                        original!,
+                        state.Checkpoint,
+                        MinecraftWorkspaceSourceReason.UnsafeSuccessorLength);
+                }
+
+                continue;
+            }
+
+            if (!HasMatchingSuspendedPrefix(state, successor.FullPath))
+            {
+                if (IsSourceEnabled(state.Source.SourceId))
+                {
+                    SetHandoffFaulted(
+                        successor,
+                        state.Checkpoint,
+                        MinecraftWorkspaceSourceReason.UnsafeSuccessorLength);
+                }
+
+                continue;
+            }
+
+            Dictionary<string, PendingHandoff> handoffs = state.Source.Family == MinecraftSourceFamily.Yeezus
+                ? _pendingYeezusHandoffs
+                : _pendingCfmHandoffs;
+            StorePendingHandoff(
+                handoffs,
+                state.Source.SourceId,
+                new PendingHandoff(
+                    state.Checkpoint,
+                    Math.Max(state.ObservedLength, state.Checkpoint.ConsumedByteFrontier),
+                    SuccessorLengthAtBoundary: null,
+                    successor.FileId,
+                    IsAmbiguous: false));
+        }
+    }
+
+    private bool TryResumeSuspendedSource (DiscoveredSourceFile source)
+    {
+        SuspendedSource? suspended;
+        lock (_gate)
+        {
+            suspended = _suspendedSources.GetValueOrDefault(source.FileId);
+        }
+
+        if (suspended is null)
+        {
+            return false;
+        }
+
+        MinecraftSourceHandoffCheckpoint? checkpoint = suspended.Checkpoint;
+        if (checkpoint is null || !HasMatchingSuspendedPrefix(suspended, source.FullPath))
+        {
+            lock (_gate)
+            {
+                _blockedResumeFileIds.Add(source.FileId);
+            }
+
+            SetHandoffFaulted(
+                source,
+                checkpoint ?? CreateUnavailableCheckpoint(suspended.Source),
+                MinecraftWorkspaceSourceReason.UnsafeSuccessorLength);
+            return true;
+        }
+
+        long? currentLength = TryGetLength(source.FullPath);
+        if (currentLength is null || currentLength < checkpoint.ConsumedByteFrontier ||
+            currentLength < checkpoint.ReplayStartByteOffset)
+        {
+            lock (_gate)
+            {
+                _blockedResumeFileIds.Add(source.FileId);
+            }
+
+            SetHandoffFaulted(source, checkpoint, currentLength is null
+                ? MinecraftWorkspaceSourceReason.UnsafeSuccessorLength
+                : MinecraftWorkspaceSourceReason.SuccessorTooShort);
+            return true;
+        }
+
+        SourceProgress next = GetNextProgress(source.FileId);
+        SourceProgress previous = GetProgress(source.FileId);
+        long initialSequence = Math.Max(checkpoint.NextSourceLocalSequence, previous.NextSourceLocalSequence);
+        var readRequest = new MinecraftWorkspaceSourceReadRequest(
+            checkpoint.ReplayStartByteOffset,
+            checkpoint.ReplayStartPhysicalLineNumber,
+            next.Generation,
+            initialSequence);
+        if (StartSource(source, readRequest, checkpoint))
+        {
+            lock (_gate)
+            {
+                _suspendedSources.Remove(source.FileId);
+                _blockedResumeFileIds.Remove(source.FileId);
+            }
+        }
+
+        return true;
+    }
+
+    private static bool HasMatchingSuspendedPrefix (SuspendedSource suspended, string candidatePath)
+    {
+        if (suspended.PrefixHash is null || TryGetLength(candidatePath) is not long candidateLength ||
+            candidateLength < suspended.ObservedLength)
+        {
+            return false;
+        }
+
+        byte[]? candidateHash = TryGetPrefixHash(candidatePath, suspended.ObservedLength);
+        return candidateHash is not null && CryptographicOperations.FixedTimeEquals(suspended.PrefixHash, candidateHash);
+    }
+
+    private static byte[]? TryGetPrefixHash (string path, long byteCount)
+    {
+        if (byteCount < 0)
+        {
+            return null;
+        }
+
+        try
+        {
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            using IncrementalHash hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+            byte[] buffer = new byte[64 * 1024];
+            long remaining = byteCount;
+            while (remaining > 0)
+            {
+                int read = stream.Read(buffer, 0, (int)Math.Min(buffer.Length, remaining));
+                if (read == 0)
+                {
+                    return null;
+                }
+
+                hash.AppendData(buffer, 0, read);
+                remaining -= read;
+            }
+
+            return hash.GetHashAndReset();
+        }
+        catch (IOException)
+        {
+            return null;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
+
+    private static DiscoveredSourceFile? FindDeterministicSuccessor (
+        DiscoveredSourceFile predecessor,
+        IReadOnlyList<DiscoveredSourceFile> discoveredFiles)
+    {
+        MinecraftSourceFamily family = predecessor.Family;
+        MinecraftSourceSegmentRole successorRole = predecessor.SegmentRole switch
+        {
+            MinecraftSourceSegmentRole.Primary when family == MinecraftSourceFamily.Yeezus => MinecraftSourceSegmentRole.Rotated,
+            MinecraftSourceSegmentRole.ActivePart when family == MinecraftSourceFamily.CactusMonitor => MinecraftSourceSegmentRole.Final,
+            _ => MinecraftSourceSegmentRole.None
+        };
+        return successorRole == MinecraftSourceSegmentRole.None
+            ? null
+            : discoveredFiles.FirstOrDefault(source => source.SourceId == predecessor.SourceId &&
+                source.Family == family && source.SegmentRole == successorRole);
+    }
+
+    private bool IsResumeBlocked (string fileId)
+    {
+        lock (_gate)
+        {
+            return _blockedResumeFileIds.Contains(fileId);
+        }
+    }
+
+    private bool HasSuspendedSource (string sourceId)
+    {
+        lock (_gate)
+        {
+            return _suspendedSources.Values.Any(source => source.Source.SourceId == sourceId);
+        }
+    }
+
+    private MinecraftSourceHandoffCheckpoint? GetSuspendedCheckpoint (string sourceId)
+    {
+        lock (_gate)
+        {
+            return GetSuspendedCheckpointUnsafe(sourceId);
+        }
+    }
+
+    private MinecraftSourceHandoffCheckpoint? GetSuspendedCheckpointUnsafe (string sourceId) =>
+        _suspendedSources.Values.FirstOrDefault(source => source.Source.SourceId == sourceId)?.Checkpoint;
+
+    private bool IsHandoffPending (string sourceId)
+    {
+        lock (_gate)
+        {
+            return _pendingCfmHandoffs.ContainsKey(sourceId) || _pendingYeezusHandoffs.ContainsKey(sourceId);
+        }
+    }
+
+    private long GetEventCount (string fileId)
+    {
+        lock (_gate)
+        {
+            return _fileEventCounts.GetValueOrDefault(fileId);
+        }
+    }
+
+    private MinecraftWorkspaceLogicalSourceSnapshot CreateLogicalSourceSnapshot (IReadOnlyList<DiscoveredSourceFile> sources)
+    {
+        bool enabled = !_disabledSourceIds.Contains(sources[0].SourceId);
+        bool hasFault = false;
+        bool hasActive = false;
+        bool allImmutable = true;
+        MinecraftWorkspaceLogicalSourceSegmentSnapshot[] segments = sources
+            .Select(source =>
+            {
+                MinecraftWorkspaceSourceRuntimeState? state = _sources.GetValueOrDefault(source.FileId);
+                MinecraftSourceHandoffCheckpoint? checkpoint = state?.Checkpoint ??
+                    _suspendedSources.Values.FirstOrDefault(saved => saved.Source.SourceId == source.SourceId)?.Checkpoint;
+                MinecraftWorkspaceSourceStatus status = !enabled
+                    ? MinecraftWorkspaceSourceStatus.Disabled
+                    : state?.Status ?? MinecraftWorkspaceSourceStatus.DeferredHandoff;
+                hasFault |= status is MinecraftWorkspaceSourceStatus.HandoffFaulted or MinecraftWorkspaceSourceStatus.Faulted;
+                hasActive |= status == MinecraftWorkspaceSourceStatus.Active;
+                allImmutable &= status == MinecraftWorkspaceSourceStatus.ImmutableComplete;
+                return new MinecraftWorkspaceLogicalSourceSegmentSnapshot(
+                    source,
+                    status,
+                    state?.Reason,
+                    state?.EmittedEventCount ?? _fileEventCounts.GetValueOrDefault(source.FileId),
+                    checkpoint is not null);
+            })
+            .ToArray();
+        MinecraftWorkspaceSourceStatus aggregateStatus = !enabled
+            ? MinecraftWorkspaceSourceStatus.Disabled
+            : hasFault
+                ? MinecraftWorkspaceSourceStatus.HandoffFaulted
+                : hasActive
+                    ? MinecraftWorkspaceSourceStatus.Active
+                    : allImmutable
+                        ? MinecraftWorkspaceSourceStatus.ImmutableComplete
+                        : MinecraftWorkspaceSourceStatus.DeferredHandoff;
+        return new MinecraftWorkspaceLogicalSourceSnapshot(
+            sources[0].SourceId,
+            sources[0].Family,
+            CreateSourceDisplayLabel(sources),
+            enabled,
+            Array.AsReadOnly(segments),
+            aggregateStatus,
+            segments.Sum(segment => segment.EmittedEventCount),
+            segments.Any(segment => segment.HasResumeCheckpoint));
+    }
+
+    private static string CreateSourceDisplayLabel (IReadOnlyList<DiscoveredSourceFile> sources) => sources[0].Family switch
+    {
+        MinecraftSourceFamily.Minecraft => "Minecraft · latest.log",
+        MinecraftSourceFamily.Yeezus => "Yeezus",
+        MinecraftSourceFamily.ReCactus => $"ReCactus · {Path.GetFileName(sources[0].RelativePath)}",
+        MinecraftSourceFamily.CactusMonitor => $"Cactus Monitor · {Path.GetFileName(sources[0].RelativePath)}",
+        _ => sources[0].Family.ToString()
+    };
+
+    private static MinecraftSourceHandoffCheckpoint CreateUnavailableCheckpoint (DiscoveredSourceFile source) =>
+        new(source.SourceId, new FileRef(source.FileId, source.FullPath, 1), source.AdapterHint, source.SegmentRole,
+            0, 1, 0, 1, ReplayStartsBeforeConsumedFrontier: false, HasUnemittedState: false, NextSourceLocalSequence: 1);
 
     private void CaptureCfmHandoffAndDispose (SourceHandle handle)
     {
@@ -341,6 +842,11 @@ public sealed class MinecraftWorkspaceLiveCoordinator : IDisposable
 
         foreach (PendingHandoffEntry entry in pending)
         {
+            if (!IsSourceEnabled(entry.Key))
+            {
+                continue;
+            }
+
             DiscoveredSourceFile? successor = discoveredFiles.FirstOrDefault(source =>
                 source.Family == MinecraftSourceFamily.Yeezus &&
                 source.SegmentRole == MinecraftSourceSegmentRole.Rotated &&
@@ -355,6 +861,12 @@ public sealed class MinecraftWorkspaceLiveCoordinator : IDisposable
             if (current.IsAmbiguous)
             {
                 SetHandoffFaulted(successor, current.Checkpoint, MinecraftWorkspaceSourceReason.AmbiguousHandoff);
+                continue;
+            }
+
+            if (!IsSuspendedCheckpointValidForSuccessor(current.Checkpoint, successor.FullPath))
+            {
+                SetHandoffFaulted(successor, current.Checkpoint, MinecraftWorkspaceSourceReason.UnsafeSuccessorLength);
                 continue;
             }
 
@@ -381,6 +893,7 @@ public sealed class MinecraftWorkspaceLiveCoordinator : IDisposable
             if (StartSource(successor, readRequest, current.Checkpoint))
             {
                 RemovePending(_pendingYeezusHandoffs, entry.Key, current);
+                RemoveSuspendedCheckpoint(current.Checkpoint);
             }
         }
     }
@@ -397,6 +910,11 @@ public sealed class MinecraftWorkspaceLiveCoordinator : IDisposable
 
         foreach (PendingHandoffEntry entry in pending)
         {
+            if (!IsSourceEnabled(entry.Key))
+            {
+                continue;
+            }
+
             DiscoveredSourceFile? successor = discoveredFiles.FirstOrDefault(source =>
                 source.Family == MinecraftSourceFamily.CactusMonitor &&
                 source.SegmentRole == MinecraftSourceSegmentRole.Final &&
@@ -411,6 +929,12 @@ public sealed class MinecraftWorkspaceLiveCoordinator : IDisposable
             if (current.IsAmbiguous)
             {
                 SetHandoffFaulted(successor, current.Checkpoint, MinecraftWorkspaceSourceReason.AmbiguousHandoff);
+                continue;
+            }
+
+            if (!IsSuspendedCheckpointValidForSuccessor(current.Checkpoint, successor.FullPath))
+            {
+                SetHandoffFaulted(successor, current.Checkpoint, MinecraftWorkspaceSourceReason.UnsafeSuccessorLength);
                 continue;
             }
 
@@ -433,6 +957,7 @@ public sealed class MinecraftWorkspaceLiveCoordinator : IDisposable
             if (StartSource(successor, readRequest, current.Checkpoint))
             {
                 RemovePending(_pendingCfmHandoffs, entry.Key, current);
+                RemoveSuspendedCheckpoint(current.Checkpoint);
             }
         }
     }
@@ -498,7 +1023,10 @@ public sealed class MinecraftWorkspaceLiveCoordinator : IDisposable
             return false;
         }
 
-        var handle = new SourceHandle(source, session, readRequest, immutableSnapshot);
+        var handle = new SourceHandle(source, session, readRequest, immutableSnapshot)
+        {
+            EmittedEventCount = GetEventCount(source.FileId)
+        };
         handle.Handler = (sender, args) => OnSessionEvents(handle, sender, args);
         handle.HandoffHandler = (sender, args) => OnHandoffCheckpoint(handle, sender, args);
 
@@ -609,6 +1137,8 @@ public sealed class MinecraftWorkspaceLiveCoordinator : IDisposable
                     ingestedAtUtc));
                 handle.EmittedEventCount = checked(handle.EmittedEventCount + 1);
             }
+
+            _fileEventCounts[handle.Source.FileId] = handle.EmittedEventCount;
 
             CaptureProgress(handle);
             if (_sources.TryGetValue(handle.Source.FileId, out MinecraftWorkspaceSourceRuntimeState? state))
@@ -871,6 +1401,32 @@ public sealed class MinecraftWorkspaceLiveCoordinator : IDisposable
         }
     }
 
+    private bool IsSuspendedCheckpointValidForSuccessor (MinecraftSourceHandoffCheckpoint checkpoint, string path)
+    {
+        SuspendedSource? suspended;
+        lock (_gate)
+        {
+            suspended = _suspendedSources.Values.FirstOrDefault(state => state.Checkpoint == checkpoint);
+        }
+
+        return suspended is null || HasMatchingSuspendedPrefix(suspended, path);
+    }
+
+    private void RemoveSuspendedCheckpoint (MinecraftSourceHandoffCheckpoint checkpoint)
+    {
+        lock (_gate)
+        {
+            foreach (string fileId in _suspendedSources
+                .Where(pair => pair.Value.Checkpoint == checkpoint)
+                .Select(pair => pair.Key)
+                .ToArray())
+            {
+                _suspendedSources.Remove(fileId);
+                _blockedResumeFileIds.Remove(fileId);
+            }
+        }
+    }
+
     private static void RemoveMissingSuccessors (
         Dictionary<string, PendingHandoff> target,
         ISet<string> presentFileIds)
@@ -970,6 +1526,12 @@ public sealed class MinecraftWorkspaceLiveCoordinator : IDisposable
     }
 
     private sealed record SourceProgress (long Generation, long NextSourceLocalSequence);
+
+    private sealed record SuspendedSource (
+        DiscoveredSourceFile Source,
+        MinecraftSourceHandoffCheckpoint? Checkpoint,
+        long ObservedLength,
+        byte[]? PrefixHash);
 
     private sealed record PendingHandoff (
         MinecraftSourceHandoffCheckpoint Checkpoint,

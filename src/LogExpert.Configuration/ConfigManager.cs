@@ -603,6 +603,13 @@ public class ConfigManager : IConfigManager
         settings.Preferences.ColumnizerMaskList ??= [];
 
         settings.FileHistoryList ??= [];
+        settings.RecentMinecraftWorkspaceRoots ??= [];
+        settings.MinecraftWorkspaceSourcePolicies ??= [];
+        foreach (MinecraftWorkspaceSourcePolicySettings sourcePolicy in settings.MinecraftWorkspaceSourcePolicies)
+        {
+            sourcePolicy.DisabledSourceIds ??= [];
+            sourcePolicy.WorkspaceId ??= string.Empty;
+        }
 
         settings.LastOpenFilesList ??= [];
 
